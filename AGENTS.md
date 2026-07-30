@@ -33,4 +33,5 @@ Write and work like a senior engineer.
 - Give short progress updates while working.
 - Surface assumptions and tradeoffs early.
 - Lead with findings, blockers, or verification results.
+- After every change, clearly explain what changed, including the files touched, the practical effect, and how it was checked.
 - Keep final responses concise and grounded in the actual diff.
