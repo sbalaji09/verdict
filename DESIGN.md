@@ -616,3 +616,201 @@ demonstrate.
   attribution would treat as two separate files rather than recognizing
   the rename. Uncommon enough in the fixtures this phase targets not to be
   worth the added detection logic yet.
+
+---
+
+## Phase 3 — Economic Scoring
+
+## Why cost-to-correct, and not raw token cost
+
+A dashboard that says "Agent A used 2.1M tokens this month, Agent B used
+900K" tells you almost nothing useful, for a reason that's easy to miss:
+it silently assumes every token bought the same thing. It doesn't. A cheap
+agent that fails twice and needs a third attempt can easily cost *more*
+overall than an expensive agent that gets it right the first time — and a
+raw token/dollar total actively hides this, because it has no notion of
+"got there" at all. It's a measure of *effort spent*, not *value
+produced*.
+
+Two specific ways raw cost lies, worth naming because both are easy to
+miss if you only look at a total:
+
+1. **It rewards giving up cheaply.** An agent that fails fast and never
+   retries posts a *lower* token bill than one that actually solves the
+   task — and a raw-cost leaderboard would rank the one that produced
+   nothing as more "efficient."
+2. **It hides retries as if they were free.** If only the winning
+   attempt's cost is counted, three failed attempts before a fourth
+   succeeds look identical, cost-wise, to succeeding on the first try.
+   They are not identical — the first is 4x the spend for the same
+   outcome — and a metric that can't see the difference can't be used to
+   choose between agents.
+
+`pass_rate_per_dollar` fixes both: it's *value produced* (tasks
+confirmed `DONE` — the same proven, executed fact Phase 0's schema was
+built around, not a self-report) divided by *everything it took to get
+there*, dead ends included. One verdict point per task confirmed `DONE`;
+`pass_rate_per_dollar = tasks_done / total_$_across_every_attempt`. That
+number answers the question that actually matters when picking a config:
+*for a dollar spent, how much verified-correct work do I get back?* — not
+*how many tokens did this burn*.
+
+## Why cost had to become a multi-attempt concept
+
+Every phase through Phase 2 assumed one task → one attempt → one `Verdict`
+— Phase 0's own DESIGN.md scoped multi-attempt orchestration out
+explicitly. "Track cost across all attempts, including dead ends" doesn't
+fit inside that shape: there's no such thing as "dead ends" without
+something making — and remembering — more than one attempt. So Phase 3
+introduces the first orchestration layer above a single `run()`:
+
+```python
+def run_with_retries(task, repo, adapter, max_attempts=1) -> TaskRun:
+    attempts = []
+    for _ in range(max(max_attempts, 1)):
+        verdict = run(task=task, repo=repo, adapter=adapter)
+        attempts.append(verdict)
+        if verdict.done:
+            break
+    return TaskRun(task=task, agent=adapter.name, repo=str(repo), attempts=attempts)
+```
+
+Every attempt gets kept, not just the winner — that's the entire feature,
+and it's a two-line loop because `run()` was already fully self-contained
+(its own isolated worktree, its own gates, its own attribution) from
+Phase 0 onward. `max_attempts` defaults to **1**: retries are opt-in via
+`--max-attempts`, not automatic. With `ClaudeCodeAdapter`, every retry is
+real spend — Verdict re-running an agent three times without being asked
+would mean silently tripling someone's bill the first time they hit a
+flaky failure. Existing single-attempt behavior and cost is unchanged
+unless a caller explicitly asks for more.
+
+## Two schema types, one for each level of aggregation
+
+```python
+class TaskRun(BaseModel):        # one task, however many attempts it took
+    task: str
+    agent: str
+    repo: str
+    attempts: list[Verdict]
+
+    @property
+    def total_cost_usd(self) -> float | None:
+        total = 0.0
+        for v in self.attempts:
+            if v.attempt.cost_usd is None:
+                return None       # never sum a partial figure and call it "total"
+            total += v.attempt.cost_usd
+        return total
+
+class ConfigResult(BaseModel):   # one (agent, config) label, across many TaskRuns
+    label: str
+    task_runs: list[TaskRun]
+
+    @property
+    def pass_rate_per_dollar(self) -> float | None:
+        cost = self.total_cost_usd
+        if cost is None or cost <= 0:
+            return None
+        return self.tasks_done / cost
+```
+
+Both totals share the same discipline that shows up everywhere else in
+this schema: **an unknown number is reported as unknown, never silently
+treated as zero.** If one attempt's `cost_usd` is `None` (an adapter that
+didn't report it, and no `verdict.yml` pricing to fall back on),
+`TaskRun.total_cost_usd` is `None` — not "the sum of what we do know,"
+which would look precise while quietly being wrong. The same logic
+propagates up to `ConfigResult`, and `pass_rate_per_dollar` refuses to
+divide by an unknown or zero cost rather than returning a number that
+looks meaningful but isn't (division by zero would be `inf`, which sorts
+as "best" on a naive leaderboard — exactly backwards for "we don't
+actually know what this cost").
+
+`ConfigResult.label` is a free-form string the caller supplies (e.g.
+`"claude-code / sonnet"` vs `"claude-code / opus"`) rather than a
+structured `{agent, model}` pair — Verdict doesn't need to understand
+*what* varies between two configs to compare their economics, only that
+they're being compared.
+
+## Where the dollar figure actually comes from
+
+`AttemptResult.cost_usd` was already populated directly by
+`ClaudeCodeAdapter` (the `claude` CLI's own `total_cost_usd`, a real
+invoice figure) since Phase 0. Phase 3 adds a fallback, applied centrally
+in `runner.py` — the same "adapters shouldn't need to know about this"
+principle Phase 2 used to move diff computation out of the adapters:
+
+```python
+def _apply_pricing_fallback(attempt, config):
+    if attempt.cost_usd is not None or config.token_pricing is None:
+        return attempt          # adapter's own figure always wins
+    computed = config.token_pricing.cost_usd(attempt.tokens_input, attempt.tokens_output)
+    return attempt.model_copy(update={"cost_usd": computed})
+```
+
+Only used when the adapter itself reported nothing — an adapter's own
+number is a real invoice; `verdict.yml`'s `cost.price_per_1k_tokens` is a
+configured estimate, and the more authoritative source always wins.
+
+## What "the leaderboard" is, and isn't, in Phase 3
+
+`economics.py` is the ranking *engine*: `rank()` sorts a list of
+`ConfigResult`s by `pass_rate_per_dollar` descending, with entries whose
+economics are undefined (unknown or zero cost) sorted after every entry
+with a real number — never first (that would reward not knowing your own
+cost) and never dropped silently (an entry a leaderboard can't rank is
+still worth showing, with an honest `—` rather than a fabricated number).
+Ties within that undefined group fall back to raw pass rate, since that's
+still real signal even without a cost figure to divide by. `render()`
+prints it as a table.
+
+What doesn't exist yet: anything that *populates* a list of `ConfigResult`
+from a real multi-task benchmark suite automatically. There's no suite
+file format, no `verdict bench` command, no persisted run history across
+CLI invocations — a `ConfigResult` today is something a caller assembles
+by hand (or a test does, as in `test_economics.py`) from `TaskRun`s they
+already have. This was a deliberate scope line, confirmed before writing
+any code: building a suite format now would mean designing Phase 5
+("benchmark suites") under Phase 3's name, before Phase 5 gets to define
+what a suite actually looks like. Phase 3 ships the math and the ranking
+rule, fully tested; Phase 5 wires a real suite runner to feed it.
+
+## Tests
+
+`test_economics.py` covers the accounting claims directly, not just
+end-to-end:
+
+- Cost sums across *every* attempt, including attempts that failed —
+  proven with a `TaskRun` built from 2 dead ends + 1 winner, asserting the
+  total includes all three, not just the winner's cost.
+- Any single unknown attempt cost makes the `TaskRun` total unknown, not a
+  partial sum.
+- The `pass_rate_per_dollar` formula itself, plus its two "refuse to
+  answer" cases: unknown cost, and zero cost (not treated as `inf`).
+- `rank()`'s ordering, including the "unknown cost sorts last, tiebroken
+  by pass rate" rule.
+- `run_with_retries` end-to-end against a real worktree, using a small
+  test-only adapter that fails twice before fixing the bug on its third
+  call — asserting the resulting `TaskRun` has exactly 3 attempts, 2 of
+  them counted failed, and cost summed across all 3 (not just the
+  successful one) — the concrete "dead ends get counted" claim the brief
+  asked for, checked against real orchestration rather than asserted in
+  the abstract.
+- The pricing fallback: an adapter-reported cost is never overridden by
+  `verdict.yml` pricing, and pricing only fills in when the adapter
+  reported nothing at all.
+
+## What's explicitly out of scope for Phase 3
+
+- No suite file format, no `verdict bench` command, no persisted
+  cross-invocation run history — see above. `ConfigResult` is a library
+  type today, not yet a CLI-driven report over many tasks read from disk.
+- No retry *strategy* beyond "try again from scratch, up to N times." No
+  backoff, no changing the prompt on retry, no giving the agent visibility
+  into why the previous attempt failed. Each retry is an independent,
+  identical attempt at the same task.
+- `pass_rate` in `ConfigResult` is unweighted — ten easy tasks and one
+  hard task count equally. Difficulty-weighting is a suite-design concern
+  that belongs with Phase 5's suite format, not this phase's aggregation
+  math.
