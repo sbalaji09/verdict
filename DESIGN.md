@@ -304,3 +304,315 @@ fixture invented just for the CLI demo.
   and eslint/ruff — not every stack (e.g. no Rust/cargo, no Java/Maven).
   `verdict.yml` covers anything not autodetected, at the cost of
   structured parsing.
+
+---
+
+## Phase 2 — Causal Failure Attribution
+
+## The goal, restated
+
+For every failing `PROVEN` gate, answer: *which specific file the agent
+changed caused this, and why isn't a guess?* The output shape is the
+README's own example: *"agent edited `FILE`, which caused `CHECK` to fail
+at `LOCATION`."* The hard constraint carried over from Phase 0's schema
+philosophy: the **link** — which file, which check — has to be an executed,
+reproducible fact, tagged `PROVEN` like everything else. Only the sentence
+wrapping that fact is template-rendered, and even that never states
+anything the structured `Attribution` record doesn't already contain.
+
+This was prototyped on paper and reviewed before any code was written (see
+the design conversation this section summarizes); two real bugs surfaced
+once the paper design met actual git, both fixed and covered by tests
+before the fixtures went green — noted inline below, since "designed
+correctly on the whiteboard" and "correct once it touches a real repo"
+turned out to be different milestones.
+
+## Two prerequisite fixes to Phase 0's worktree code
+
+Attribution needs to answer "did this fail *before* the agent touched
+anything?" and "which of the agent's real commits introduced this?" —
+neither question was answerable with what Phase 0 built:
+
+1. **`Worktree` didn't remember its own starting point.** `isolated_worktree`
+   created a branch off `HEAD` but never recorded that commit anywhere.
+   Fixed by adding `Worktree.base_commit`, captured once at creation time.
+2. **`diff_against_base` diffed against `HEAD`, not the base commit.** If
+   an agent commits mid-run, `HEAD` moves to point at its own commits, and
+   `git diff --cached HEAD` would only see trailing uncommitted scraps —
+   silently missing everything already committed. Fixed by diffing against
+   the recorded `base_commit` explicitly. This was a real, if latent, bug
+   in Phase 0/1 code, not something new to Phase 2 — Phase 2 is just what
+   finally exercised the code path (a real agent committing as it works)
+   that would have tripped over it.
+
+## The core mechanism: two-level `git bisect`
+
+The brief calls for "using git bisect over the agent's commits." Taken
+literally, that only works if the agent made multiple commits — the
+adapters built so far produce one flat diff, committed or not, all at
+once. The design handles both with the *same* mechanism, applied twice:
+
+```text
+Level 1 — commit-level bisect (real agent commits, if any)
+  base ──▶ C1 ──▶ C2 ──▶ ... ──▶ Cn (= the agent's final state)
+  Finds: the first commit where the specific failing check starts failing.
+  Skipped (trivially "the one commit") if the agent made ≤1 commit — today's
+  default, since neither adapter commits incrementally yet.
+
+Level 2 — file-level bisect, *within* the level-1 culprit commit
+  parent(culprit) ──▶ +file_a ──▶ +file_a+file_b ──▶ ... ──▶ culprit
+  These are synthetic commits Verdict builds itself: for each file the
+  culprit commit touched, `git checkout <culprit> -- <file>` pulls that
+  file's *final* content and commits it — cumulative, so the last
+  synthetic commit's tree is byte-identical to the culprit commit's tree.
+  Bisects again over this ladder to find the exact culprit *file*.
+```
+
+Content-based reconstruction (`git checkout <commit> -- <path>`) rather
+than hand-applying that commit's diff hunk-by-hunk: patch application can
+fail on context-line mismatches; pulling a file's final blob straight from
+the commit that produced it cannot fail that way. Because each synthetic
+commit adds exactly one file, level 2's answer is always a single,
+specific file — never "somewhere in these three."
+
+**Why bisect at all, instead of just testing each changed file one at a
+time?** With *k* changed files, reverting-and-testing each one costs *k*
+re-runs. Bisection costs `O(log k)` — for a typical change touching 5–10
+files, 3–4 re-runs instead of 10. Same reason `git bisect` exists instead
+of a linear walk through history.
+
+**Why real `git bisect run`, not a hand-rolled binary search?** Two
+reasons. First, it's literally what was asked for. Second — and this is
+the reason that actually mattered once it was built — `git bisect run`
+comes with a third outcome, `skip` (exit code 125), for states where the
+question genuinely can't be answered (e.g. an intermediate synthetic state
+where the code doesn't parse because only half of a two-file change has
+landed). Reimplementing that correctly by hand would mean re-deriving a
+well-tested piece of git for no benefit.
+
+## The check: pass, fail, or skip
+
+A tiny wrapper — `attribution/bisect_cli.py` — is what `git bisect run`
+actually invokes at each candidate commit:
+
+```text
+python -m verdict.attribution.bisect_cli <gate> [identity]
+```
+
+`git bisect` checks out each candidate directly into the current working
+directory (it doesn't copy anywhere), so the wrapper just inspects
+`Path.cwd()` — no path argument needed. It re-runs the *real* gate
+(`gates/registry.py::resolve_gate`) and asks one question: is the specific
+already-known failure (`identity` — a `FailureLocation.identity`, e.g. a
+pytest node id, or `None` to mean "the gate as a whole," used for `build`)
+present in the freshly parsed result?
+
+- Present → **bad** (exit 1)
+- Gate ran cleanly, absent → **good** (exit 0)
+- Gate's stack isn't even present at this state (`N/A`), or it failed with
+  no structured failure list to check identity against (a raw
+  `verdict.yml`-override gate) → **skip** (exit 125) — an unopinionated
+  "can't tell," never a guess in either direction.
+
+This is the same discipline as `Verdict.status` refusing to report `DONE`
+from zero evidence, applied one level down: when the check can't positively
+confirm the *exact* original failure, it says so instead of picking a side.
+
+Reusing `resolve_gate` (rather than reimplementing scoped tool invocations)
+means bisection automatically inherits every parser Phase 1 already wrote
+and tested — no new command construction, no new output parsing. It also
+means `FailureLocation.identity` had to be *stable across bisection
+states* — see `gates/typecheck.py`'s docstring on why identity is
+`"{file}:{code}"`, deliberately excluding the line number, which drifts as
+a diff is partially applied.
+
+## Bug #1, found by testing against real git: `HEAD` lies after `bisect run`
+
+The first version of the bisection primitive read the culprit off
+`git rev-parse HEAD` after `git bisect run` finished, on the assumption
+that git leaves the tree checked out at the answer. Testing against a real
+3-commit fixture (base → unrelated change → the actual bug) proved that
+assumption wrong: when bisection can conclude the answer *without* needing
+to re-test the commit already known to be bad (a common case with few
+candidates), git leaves `HEAD` at the last commit it actually *tested* —
+which can be the adjacent **good** commit, not the bad one. The real
+answer only exists as text: `git bisect run` prints
+`"<sha> is the first bad commit"` on success. The fix
+(`attribution/bisect.py`) parses that line instead of trusting the final
+working-tree state. Left as a comment at the fix site, since it's exactly
+the kind of "worked on paper, wrong against real git" trap worth flagging
+for the next person who touches this code.
+
+## Bug #2, found the same way: gates contaminate "the agent's diff"
+
+The original design committed the agent's final state (for level-1's
+commit ladder) *after* running the gates, on the theory that "commit
+whatever's sitting in the worktree" was a simple, late-as-possible step.
+Testing against a real repo showed why that's wrong: running pytest leaves
+`__pycache__/*.pyc` behind as a side effect, and `git add -A` doesn't know
+the difference between "the agent wrote this" and "a tool we ran
+afterward wrote this." The result was bisection confidently naming a
+compiled `.pyc` file as the culprit. Fixed by moving the commit
+(`runner.py`) to immediately after `adapter.run()` returns and *before*
+any gate executes — so `attempt_commit` captures exactly what the agent
+changed, and whatever gates leave behind afterward is simply never staged
+into anything attribution looks at.
+
+Both bugs share a shape worth naming: the paper design was internally
+consistent and still wrong, because it made an assumption about git or
+about process side effects that only a real repo could contradict. Neither
+would have been caught by reasoning about the algorithm harder — only by
+running it.
+
+## Step 0: is this even the agent's fault?
+
+Before any bisection, the exact same check the bisector uses runs once
+against the worktree's `base_commit` (pre-agent). If it already fails
+there, attribution stops: this is `PRE_EXISTING`, not a `REGRESSION`, and
+no amount of bisecting the agent's diff will explain a failure the agent
+didn't introduce. Cheap (one gate run, no bisection), and it's the
+difference between "the agent broke this" and "this was already broken" —
+a distinction a raw pass/fail gate result can't make on its own.
+
+## Enrichment: the dependency graph never gets to vote
+
+Once level 2 names a culprit file, `attribution/depgraph.py` builds a
+lightweight static import graph (Python: `ast`-parsed `import`/`from`
+statements, resolved against every `.py` file's dotted module path; JS/TS:
+regex-scanned `import ... from` / `require(...)`, resolved only for
+relative specifiers) and checks for a path from the failure's file to the
+culprit file, up to 4 hops.
+
+- Found → the sentence gets a supporting clause: *"(`test_login.py`
+  depends on `auth.py`.)"*
+- Not found → the `Attribution` is reported exactly the same, just without
+  that clause.
+
+This is deliberately not a real resolver — no `sys.path`/tsconfig `paths`
+awareness, no dynamic-import handling, no distinguishing a package from
+what it re-exports. A full resolver is a project of its own, and it isn't
+what's load-bearing here: the graph can *only add* a clause, never remove
+or override the bisection result. Missing an edge (a real, expected
+outcome — dynamic imports, config-driven wiring, and runtime string
+references are all invisible to a static scan) means a thinner sentence,
+never a wrong attribution. This is the same PROVEN/JUDGED discipline from
+Phase 0, recursed one level: the *link* is proven by execution; the *why*
+is enrichment, and enrichment doesn't get a vote on whether the link holds.
+
+## Schema additions (all additive — `status`/`done`/`confidence` unchanged)
+
+```python
+class FailureLocation(BaseModel):
+    identity: str          # stable across bisection states — see typecheck.py
+    file: str | None = None
+    line: int | None = None
+    code: str | None = None
+    message: str = ""
+
+class AttributionKind(str, Enum):
+    REGRESSION = "regression"      # bisection isolated exactly one culprit file
+    PRE_EXISTING = "pre_existing"  # failed before the agent touched anything
+    INCONCLUSIVE = "inconclusive"  # bisection ran but couldn't cleanly converge
+
+class DependencyLink(BaseModel):
+    from_file: str
+    to_file: str
+    depth: int
+
+class Attribution(BaseModel):
+    provenance: Provenance = Provenance.PROVEN   # the link is always proven
+    kind: AttributionKind
+    check_name: str
+    failure_id: str
+    failure_location: str | None = None
+    culprit_file: str | None = None
+    method: str                                   # "baseline" / "bisect(commit)" / "bisect(file)" / ...
+    dependency_link: DependencyLink | None = None
+    explanation: str                              # a rendering of the fields above, not a new claim
+```
+
+`Signal.failures: list[FailureLocation]` is the other addition — each gate
+parser already built this structure internally (junit XML → `failed_names`,
+mypy/tsc/eslint/ruff JSON → per-error lists) and previously threw it away
+by flattening straight into the `detail` string. Phase 2 needed that
+structure back, so the parsers now return it instead of re-deriving it by
+parsing `detail` text a second time — reusing Phase 1's investment rather
+than duplicating it.
+
+`Attribution.provenance` defaults to `Provenance.PROVEN` — attribution
+doesn't invent a parallel trust system, it reuses Phase 0's enum directly.
+There is deliberately no `JUDGED` attribution in Phase 2: every
+`Attribution` in this codebase is proven by bisection or it doesn't exist.
+
+## Worked example: `forgot-to-update-fixture`
+
+`scale(x)` multiplies by a constant `MULTIPLIER` defined in `settings.py`;
+`fixtures/expected.json` is a precomputed answer for a specific input,
+checked by a test. The agent's task: change the multiplier. It edits
+`settings.py` — correctly — and never touches the now-stale fixture.
+
+1. **Baseline**: the test passes at `base_commit`. Not pre-existing.
+2. **Level 1**: one file changed (`settings.py`) → trivially the culprit
+   commit, no bisection needed.
+3. **Level 2**: that commit touched exactly one file → trivially the
+   culprit file, no bisection needed either.
+4. **Dependency graph**: `test_calc.py` imports `scale` from `calc.py`,
+   which imports `MULTIPLIER` from `settings.py` — a 2-hop edge found.
+5. **Result**: `Attribution(kind=REGRESSION, culprit_file="settings.py", ...)`.
+
+This is the fixture that most directly demonstrates a real limitation,
+stated plainly rather than papered over: Verdict attributes to files the
+agent *changed*, never to files it *should have changed but didn't*. A
+human reviewer would say "you also needed to regenerate the fixture" —
+that's a fact about what's missing from the diff, not about what's in it,
+and attribution has no mechanism for claims about absence. `settings.py`
+is still the correct, honest answer to "which edit caused this failure,"
+even though it isn't the complete story a human would tell.
+
+## Fixtures
+
+| Fixture | What it exercises |
+|---|---|
+| `test_broke_a_test_attributes_to_the_edited_file` | Baseline case: one file changed, direct dependency edge, no bisection needed |
+| `test_unrelated_file_is_never_blamed` | Two files changed (one relevant, one a decoy); validates bisection precision, not just "blame the diff" |
+| `test_forgot_to_update_fixture_blames_the_file_actually_touched` | The limitation above, made concrete and asserted on |
+| `test_import_error_is_attributed_not_crashed_on` | A collection-time `ImportError`, not a normal assertion failure — different junit XML shape (`classname=""`, `name=<module>`); required fixing `_node_id` to recognize this case rather than construct a bogus `.py::name` identity |
+| `test_pre_existing_failure_is_not_blamed_on_the_agent` | Step 0 correctly refuses to attribute a failure that predates the attempt |
+
+All five run the real pipeline end to end — real git repos, real `git
+bisect`, real gate re-runs — not mocked bisection. Slower than a pure unit
+test (a few seconds total for all five), but this is exactly the class of
+logic (subtle git semantics, process side effects) that looks correct on
+paper and needs to be checked against the real thing, as both bugs above
+demonstrate.
+
+## What's explicitly out of scope for Phase 2
+
+- **No LLM phrasing pass.** `explanation` is template-rendered, not
+  model-generated — a deliberate decision (discussed and confirmed before
+  implementation): it's zero-cost, zero-latency, and has no hallucination
+  surface, and the brief's own README example sentence is already fully
+  reachable from the structured `Attribution` fields with a format string.
+  A phrasing pass remains a pure presentation upgrade addable later
+  without touching the algorithm.
+- **File granularity, not line/hunk granularity.** Level 2 always narrows
+  to "this file," never "this specific line." Going finer would mean
+  hunk-level synthetic commits — meaningfully more bisection steps for
+  marginal gain, since the diff itself already shows which lines in the
+  named file changed.
+- **No cross-failure batching.** Each individual failure (each failing
+  test, each typecheck error) is attributed independently, even when
+  several clearly share the same root cause — so a change that breaks 5
+  tests the same way triggers 5 independent bisections rather than
+  recognizing they'd converge on the same answer. Capped at 5 attributions
+  per gate (`MAX_ATTRIBUTIONS_PER_GATE`) to bound worst-case cost on a
+  badly broken repo; not silent — the cap is a documented constant, not a
+  quietly dropped tail.
+- **Dependency graph covers Python and JS/TS only**, and only static,
+  relative-import-resolvable edges — matching the two stacks the example
+  repos and gates already target.
+- **No handling of renamed files as a single unit** — git's diff surfaces
+  a rename without `-M` detection as a delete-and-add pair, which
+  attribution would treat as two separate files rather than recognizing
+  the rename. Uncommon enough in the fixtures this phase targets not to be
+  worth the added detection logic yet.
