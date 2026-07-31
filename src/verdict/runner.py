@@ -4,34 +4,22 @@ adapter do the work, run the gates, assemble a Verdict.
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 from verdict.adapters import Adapter
 from verdict.attribution.engine import attribute_failures
 from verdict.config import VerdictConfig, load_config
+from verdict.frontend.runner import run_frontend_checks
 from verdict.gates.registry import run_all_gates
 from verdict.schema import AttemptResult, TaskRun, Verdict
-from verdict.worktree import commit_all, diff_against_base, isolated_worktree
+from verdict.worktree import (
+    commit_all,
+    copy_vendored_dependencies,
+    diff_against_base,
+    isolated_worktree,
+)
 
 DEFAULT_MAX_ATTEMPTS = 1
-
-# Dependency directories that live outside git (installed, not committed —
-# correctly so) but that build/typecheck/lint gates need present to run at
-# all. `git worktree` only checks out tracked files, so a fresh worktree
-# never has these; without this, an npm-based repo would report every gate
-# N/A (or a misleading FAIL from a missing binary) on every single run.
-# Copied rather than symlinked so the agent can freely reinstall/mutate
-# without ever touching the source repo's copy — same isolation guarantee
-# worktree.py already gives tracked files, extended to this untracked one.
-_VENDORED_DEPENDENCY_DIRS = ("node_modules",)
-
-
-def _copy_vendored_dependencies(repo: Path, worktree: Path) -> None:
-    for name in _VENDORED_DEPENDENCY_DIRS:
-        source = repo / name
-        if source.is_dir() and not (worktree / name).exists():
-            shutil.copytree(source, worktree / name, symlinks=True)
 
 
 def run(
@@ -45,7 +33,7 @@ def run(
     down before this returns, win or lose.
     """
     with isolated_worktree(repo) as worktree:
-        _copy_vendored_dependencies(repo, worktree.path)
+        copy_vendored_dependencies(repo, worktree.path)
         attempt = adapter.run(task, worktree.path)
         diff, files_changed = diff_against_base(worktree.path, worktree.base_commit)
         attempt = attempt.model_copy(update={"diff": diff, "files_changed": files_changed})
@@ -61,6 +49,17 @@ def run(
         attempt = _apply_pricing_fallback(attempt, config)
         signals = run_all_gates(worktree.path, config)
         attributions = attribute_failures(repo, worktree, attempt_commit, signals)
+
+        # Frontend checks run after gates/attribution, and their signals are
+        # appended afterward rather than folded into `signals` beforehand —
+        # attribution's bisector only knows the four gate names in
+        # gates/registry.py's GATE_RUNNERS, and would crash trying to
+        # `resolve_gate("frontend:...")`. A failing frontend check is real
+        # PROVEN evidence for Verdict.status either way; it's just not
+        # (yet) bisectable to a culprit file the way test/typecheck/build/
+        # lint failures are.
+        frontend_signals = run_frontend_checks(repo, worktree, config, task)
+        signals = signals + frontend_signals
 
     return Verdict(
         task=task,

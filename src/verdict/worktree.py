@@ -30,6 +30,22 @@ class WorktreeError(RuntimeError):
     """Raised when git worktree setup or teardown fails."""
 
 
+# Dependency directories that live outside git (installed, not committed —
+# correctly so) but that build/typecheck/lint gates — and, since Phase 4,
+# the frontend dev server — need present to run at all. `git worktree` only
+# checks out tracked files, so a fresh worktree never has these. Copied
+# rather than symlinked so an agent (or a dev server it starts) can freely
+# reinstall/mutate without ever touching the source repo's copy.
+VENDORED_DEPENDENCY_DIRS = ("node_modules",)
+
+
+def copy_vendored_dependencies(repo: Path, worktree_path: Path) -> None:
+    for name in VENDORED_DEPENDENCY_DIRS:
+        source = repo / name
+        if source.is_dir() and not (worktree_path / name).exists():
+            shutil.copytree(source, worktree_path / name, symlinks=True)
+
+
 @dataclass
 class Worktree:
     path: Path
