@@ -1,7 +1,9 @@
 """The `lint` gate: eslint for JS/TS repos, ruff for Python ones.
 
 Both tools have native JSON reporters, so both paths get exact, parsed
-diagnostic counts rather than scraped text.
+diagnostic counts rather than scraped text. As with typecheck, each
+violation's `identity` is `"{file}:{code}"`, not including the line number
+— see typecheck.py's docstring for why.
 """
 
 from __future__ import annotations
@@ -11,29 +13,34 @@ import subprocess
 from pathlib import Path
 
 from verdict.gates.base import ToolRunner, exec_command, tail
-from verdict.schema import GateStatus, Provenance, Signal
+from verdict.schema import FailureLocation, GateStatus, Provenance, Signal
 
 
-def _parse_eslint(result: subprocess.CompletedProcess[str]) -> tuple[str, GateStatus]:
+def _parse_eslint(result: subprocess.CompletedProcess[str]) -> tuple[str, GateStatus, list[FailureLocation]]:
     try:
         files = json.loads(result.stdout)
     except json.JSONDecodeError:
-        return tail(result.stdout + result.stderr), (
-            GateStatus.PASS if result.returncode == 0 else GateStatus.FAIL
-        )
+        status = GateStatus.PASS if result.returncode == 0 else GateStatus.FAIL
+        return tail(result.stdout + result.stderr), status, []
 
-    error_count = sum(f.get("errorCount", 0) for f in files)
-    detail = f"{error_count} error(s)"
-    messages = [
-        f"{f['filePath']}:{m.get('line')} {m.get('ruleId')}: {m.get('message')}"
+    failures = [
+        FailureLocation(
+            identity=f"{f['filePath']}:{m.get('ruleId')}",
+            file=f["filePath"],
+            line=m.get("line"),
+            code=m.get("ruleId"),
+            message=m.get("message", ""),
+        )
         for f in files
         for m in f.get("messages", [])
         if m.get("severity") == 2
     ]
-    if messages:
-        detail += "\n" + "\n".join(messages[:10])
-    status = GateStatus.FAIL if error_count else GateStatus.PASS
-    return detail, status
+
+    detail = f"{len(failures)} error(s)"
+    if failures:
+        detail += "\n" + "\n".join(f"{f.file}:{f.line} {f.code}: {f.message}" for f in failures[:10])
+    status = GateStatus.FAIL if failures else GateStatus.PASS
+    return detail, status, failures
 
 
 class EslintRunner:
@@ -68,7 +75,7 @@ class EslintRunner:
         binary = str(worktree / "node_modules" / ".bin" / "eslint")
         command = [binary, ".", "-f", "json"]
         result = exec_command(command, cwd=worktree)
-        detail, status = _parse_eslint(result)
+        detail, status, failures = _parse_eslint(result)
         return Signal(
             name=self.gate,
             provenance=Provenance.PROVEN,
@@ -76,26 +83,33 @@ class EslintRunner:
             detail=detail,
             command=" ".join(command),
             exit_code=result.returncode,
+            failures=failures,
         )
 
 
-def _parse_ruff(result: subprocess.CompletedProcess[str]) -> tuple[str, GateStatus]:
+def _parse_ruff(result: subprocess.CompletedProcess[str]) -> tuple[str, GateStatus, list[FailureLocation]]:
     try:
         violations = json.loads(result.stdout)
     except json.JSONDecodeError:
-        return tail(result.stdout + result.stderr), (
-            GateStatus.PASS if result.returncode == 0 else GateStatus.FAIL
-        )
+        status = GateStatus.PASS if result.returncode == 0 else GateStatus.FAIL
+        return tail(result.stdout + result.stderr), status, []
 
-    detail = f"{len(violations)} violation(s)"
-    if violations:
-        detail += "\n" + "\n".join(
-            f"{v.get('filename')}:{v.get('location', {}).get('row')} "
-            f"{v.get('code')}: {v.get('message')}"
-            for v in violations[:10]
+    failures = [
+        FailureLocation(
+            identity=f"{v.get('filename')}:{v.get('code')}",
+            file=v.get("filename"),
+            line=v.get("location", {}).get("row"),
+            code=v.get("code"),
+            message=v.get("message", ""),
         )
-    status = GateStatus.FAIL if violations else GateStatus.PASS
-    return detail, status
+        for v in violations
+    ]
+
+    detail = f"{len(failures)} violation(s)"
+    if failures:
+        detail += "\n" + "\n".join(f"{f.file}:{f.line} {f.code}: {f.message}" for f in failures[:10])
+    status = GateStatus.FAIL if failures else GateStatus.PASS
+    return detail, status, failures
 
 
 class RuffRunner:
@@ -111,7 +125,7 @@ class RuffRunner:
     def run(self, worktree: Path) -> Signal:
         command = ["ruff", "check", "--output-format=json", "."]
         result = exec_command(command, cwd=worktree)
-        detail, status = _parse_ruff(result)
+        detail, status, failures = _parse_ruff(result)
         return Signal(
             name=self.gate,
             provenance=Provenance.PROVEN,
@@ -119,6 +133,7 @@ class RuffRunner:
             detail=detail,
             command=" ".join(command),
             exit_code=result.returncode,
+            failures=failures,
         )
 
 

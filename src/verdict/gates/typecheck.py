@@ -4,6 +4,15 @@ tsc has no native machine-readable output format, so we parse its default
 `file(line,col): error TSxxxx: message` line shape. mypy's `--output json`
 (available since mypy 2.x) prints one JSON object per diagnostic line, so
 that path is exact rather than regex-based.
+
+Each error's `identity` is `"{file}:{code}"` — deliberately *not*
+`"{file}:{line}:{code}"`. Phase 2's attribution re-runs this gate at other
+commits to see whether a specific error still reproduces, and at an
+intermediate bisection state the surrounding code has shifted, so the same
+root-cause error can land on a different line. Matching on file+code is the
+right granularity for "is this still the same problem," even though it
+means two genuinely distinct errors of the same code in the same file
+would collide — an accepted, documented imprecision, not an oversight.
 """
 
 from __future__ import annotations
@@ -14,27 +23,34 @@ import subprocess
 from pathlib import Path
 
 from verdict.gates.base import ToolRunner, exec_command, tail
-from verdict.schema import GateStatus, Provenance, Signal
+from verdict.schema import FailureLocation, GateStatus, Provenance, Signal
 
 _TSC_ERROR_RE = re.compile(
     r"^(?P<file>[^(]+)\((?P<line>\d+),(?P<col>\d+)\): error (?P<code>TS\d+): (?P<msg>.+)$"
 )
 
 
-def _parse_tsc(result: subprocess.CompletedProcess[str]) -> tuple[str, GateStatus]:
-    errors = [
-        m.groupdict() for m in (_TSC_ERROR_RE.match(line) for line in result.stdout.splitlines()) if m
-    ]
-    if not errors and result.returncode != 0:
-        return tail(result.stdout + result.stderr), GateStatus.FAIL
+def _parse_tsc(result: subprocess.CompletedProcess[str]) -> tuple[str, GateStatus, list[FailureLocation]]:
+    matches = [m for m in (_TSC_ERROR_RE.match(line) for line in result.stdout.splitlines()) if m]
+    if not matches and result.returncode != 0:
+        return tail(result.stdout + result.stderr), GateStatus.FAIL, []
 
-    detail = f"{len(errors)} error(s)"
-    if errors:
-        detail += "\n" + "\n".join(
-            f"{e['file']}:{e['line']} {e['code']}: {e['msg']}" for e in errors[:10]
+    failures = [
+        FailureLocation(
+            identity=f"{m.group('file')}:{m.group('code')}",
+            file=m.group("file"),
+            line=int(m.group("line")),
+            code=m.group("code"),
+            message=m.group("msg"),
         )
-    status = GateStatus.PASS if not errors else GateStatus.FAIL
-    return detail, status
+        for m in matches
+    ]
+
+    detail = f"{len(failures)} error(s)"
+    if failures:
+        detail += "\n" + "\n".join(f"{f.file}:{f.line} {f.code}: {f.message}" for f in failures[:10])
+    status = GateStatus.PASS if not failures else GateStatus.FAIL
+    return detail, status, failures
 
 
 class TscRunner:
@@ -50,7 +66,7 @@ class TscRunner:
         binary = str(worktree / "node_modules" / ".bin" / "tsc")
         command = [binary, "--noEmit", "--pretty", "false"]
         result = exec_command(command, cwd=worktree)
-        detail, status = _parse_tsc(result)
+        detail, status, failures = _parse_tsc(result)
         return Signal(
             name=self.gate,
             provenance=Provenance.PROVEN,
@@ -58,10 +74,11 @@ class TscRunner:
             detail=detail,
             command=" ".join(command),
             exit_code=result.returncode,
+            failures=failures,
         )
 
 
-def _parse_mypy(result: subprocess.CompletedProcess[str]) -> tuple[str, GateStatus]:
+def _parse_mypy(result: subprocess.CompletedProcess[str]) -> tuple[str, GateStatus, list[FailureLocation]]:
     diagnostics = []
     for line in result.stdout.splitlines():
         try:
@@ -71,16 +88,24 @@ def _parse_mypy(result: subprocess.CompletedProcess[str]) -> tuple[str, GateStat
     errors = [d for d in diagnostics if d.get("severity") == "error"]
 
     if not diagnostics and result.returncode not in (0, 1):
-        return tail(result.stdout + result.stderr), GateStatus.FAIL
+        return tail(result.stdout + result.stderr), GateStatus.FAIL, []
 
-    detail = f"{len(errors)} error(s)"
-    if errors:
-        detail += "\n" + "\n".join(
-            f"{e.get('file')}:{e.get('line')} {e.get('code')}: {e.get('message')}"
-            for e in errors[:10]
+    failures = [
+        FailureLocation(
+            identity=f"{e.get('file')}:{e.get('code')}",
+            file=e.get("file"),
+            line=e.get("line"),
+            code=e.get("code"),
+            message=e.get("message", ""),
         )
-    status = GateStatus.PASS if not errors else GateStatus.FAIL
-    return detail, status
+        for e in errors
+    ]
+
+    detail = f"{len(failures)} error(s)"
+    if failures:
+        detail += "\n" + "\n".join(f"{f.file}:{f.line} {f.code}: {f.message}" for f in failures[:10])
+    status = GateStatus.PASS if not failures else GateStatus.FAIL
+    return detail, status, failures
 
 
 class MypyRunner:
@@ -96,7 +121,7 @@ class MypyRunner:
     def run(self, worktree: Path) -> Signal:
         command = ["mypy", "--output", "json", "."]
         result = exec_command(command, cwd=worktree)
-        detail, status = _parse_mypy(result)
+        detail, status, failures = _parse_mypy(result)
         return Signal(
             name=self.gate,
             provenance=Provenance.PROVEN,
@@ -104,6 +129,7 @@ class MypyRunner:
             detail=detail,
             command=" ".join(command),
             exit_code=result.returncode,
+            failures=failures,
         )
 
 

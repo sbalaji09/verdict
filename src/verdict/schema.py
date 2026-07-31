@@ -65,6 +65,28 @@ class VerdictStatus(str, Enum):
     """
 
 
+class FailureLocation(BaseModel):
+    """One individual failure within a gate's result — one failing test, one
+    typecheck error, one lint violation. A gate's `detail` string is a
+    human-readable summary; `failures` is the same underlying data kept
+    structured, because Phase 2's attribution needs to re-identify "this
+    exact failure" across multiple re-runs at different commits, and text-
+    scraping `detail` back apart would just re-derive what the gate parser
+    already knew before it got flattened into a string.
+    """
+
+    identity: str
+    """A stable id for matching the *same* failure across re-runs, even as
+    line numbers drift between intermediate bisection states. A pytest node
+    id (`tests/test_x.py::test_add`) for test failures; `"{file}:{code}"`
+    for typecheck/lint, deliberately excluding the line number.
+    """
+    file: str | None = None
+    line: int | None = None
+    code: str | None = None
+    message: str = ""
+
+
 class Signal(BaseModel):
     """One executed check (or, later, one judged opinion) and its outcome."""
 
@@ -74,6 +96,7 @@ class Signal(BaseModel):
     detail: str
     command: str | None = None
     exit_code: int | None = None
+    failures: list[FailureLocation] = Field(default_factory=list)
 
 
 class AttemptResult(BaseModel):
@@ -87,6 +110,54 @@ class AttemptResult(BaseModel):
     raw_output: str | None = None
 
 
+class AttributionKind(str, Enum):
+    """How confidently — and whether — a failure was pinned on the agent."""
+
+    REGRESSION = "regression"
+    """Bisection isolated exactly one file the agent changed as necessary
+    and sufficient to reproduce the failure."""
+
+    PRE_EXISTING = "pre_existing"
+    """The failure already reproduced at the worktree's base commit, before
+    the agent touched anything — not the agent's fault, full stop."""
+
+    INCONCLUSIVE = "inconclusive"
+    """Bisection ran but couldn't cleanly isolate a single culprit (e.g. too
+    many untestable intermediate states). Honest non-answer, not a guess."""
+
+
+class DependencyLink(BaseModel):
+    """A static import edge found between the failure's location and the
+    culprit file — enrichment only. Absence of a link never weakens the
+    Attribution's own proof (that's bisection's job); presence only adds a
+    supporting "why" sentence.
+    """
+
+    from_file: str
+    to_file: str
+    depth: int
+
+
+class Attribution(BaseModel):
+    """A causal claim: this failing check, at this location, was caused by
+    the agent's change to this file. The *link* (kind, culprit_file, method)
+    is always PROVEN — derived from bisection, an executed, repeatable
+    procedure — never from an opinion. `explanation` is a template-rendered
+    sentence over those same fields; it renders the proof, it doesn't add
+    to it.
+    """
+
+    provenance: Provenance = Provenance.PROVEN
+    kind: AttributionKind
+    check_name: str
+    failure_id: str
+    failure_location: str | None = None
+    culprit_file: str | None = None
+    method: str
+    dependency_link: DependencyLink | None = None
+    explanation: str
+
+
 class Verdict(BaseModel):
     """The end-to-end result of grading one agent attempt at one task."""
 
@@ -95,6 +166,7 @@ class Verdict(BaseModel):
     repo: str
     attempt: AttemptResult
     signals: list[Signal]
+    attributions: list[Attribution] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     def _proven_applicable(self) -> list[Signal]:

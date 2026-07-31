@@ -2,7 +2,11 @@
 
 Each runner asks its tool for a structured report (junit XML, jest's own
 --json, go test's -json event stream) rather than scraping human-readable
-stdout, so the parsed counts are exact rather than regex-guessed.
+stdout, so the parsed counts are exact rather than regex-guessed, and each
+individual failure comes back as a `FailureLocation` with a stable
+`identity` — Phase 2's attribution re-runs a single test by this identity
+to check whether it reproduces at other commits, so it has to be something
+`pytest <identity>` can actually be given back, not just a display label.
 """
 
 from __future__ import annotations
@@ -14,7 +18,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from verdict.gates.base import ToolRunner, exec_command, tail
-from verdict.schema import GateStatus, Provenance, Signal
+from verdict.schema import FailureLocation, GateStatus, Provenance, Signal
 
 
 class PytestRunner:
@@ -36,7 +40,7 @@ class PytestRunner:
         command = ["pytest", "-q", f"--junitxml={report_path}"]
         try:
             result = exec_command(command, cwd=worktree)
-            detail, status = _parse_junit(report_path, fallback=result.stdout + result.stderr)
+            detail, status, failures = _parse_junit(report_path, fallback=result.stdout + result.stderr)
         finally:
             Path(report_path).unlink(missing_ok=True)
 
@@ -49,37 +53,64 @@ class PytestRunner:
             detail=detail,
             command=" ".join(command),
             exit_code=result.returncode,
+            failures=failures,
         )
 
 
-def _parse_junit(report_path: str, fallback: str) -> tuple[str, GateStatus | None]:
+def _node_id(classname: str, name: str) -> str:
+    """Reconstruct a `pytest <path>::<name>`-runnable node id from junit's
+    `classname` (a dotted module path, e.g. "tests.test_x"). Doesn't handle
+    every possible rootdir/conftest layout, but covers the common
+    unpackaged-tests-directory case our autodetection already targets.
+
+    A collection error (e.g. an ImportError at module load) is a special
+    case: pytest reports it with `classname=""` and `name=<module>` — there
+    was no specific test function to select, since the module never even
+    finished importing. The re-runnable id there is just the file itself,
+    not `file.py::name` (which isn't a valid node id and wouldn't
+    reproduce the same failure mode during bisection).
+    """
+    if not classname:
+        return f"{name}.py"
+    path = classname.replace(".", "/") + ".py"
+    return f"{path}::{name}"
+
+
+def _parse_junit(
+    report_path: str, fallback: str
+) -> tuple[str, GateStatus | None, list[FailureLocation]]:
     try:
         root = ET.parse(report_path).getroot()
     except (ET.ParseError, FileNotFoundError):
-        return tail(fallback), None
+        return tail(fallback), None, []
 
     suite = root if root.tag == "testsuite" else root.find("testsuite")
     if suite is None:
-        return tail(fallback), None
+        return tail(fallback), None, []
 
     total = int(suite.get("tests", 0))
-    failures = int(suite.get("failures", 0))
+    failures_count = int(suite.get("failures", 0))
     errors = int(suite.get("errors", 0))
     skipped = int(suite.get("skipped", 0))
-    passed = total - failures - errors - skipped
+    passed = total - failures_count - errors - skipped
 
-    failed_names = [
-        tc.get("classname", "") + "::" + tc.get("name", "")
-        for tc in suite.findall("testcase")
-        if tc.find("failure") is not None or tc.find("error") is not None
-    ]
+    failures: list[FailureLocation] = []
+    for tc in suite.findall("testcase"):
+        failure_el = tc.find("failure")
+        error_el = tc.find("error")
+        if failure_el is None and error_el is None:
+            continue
+        node_id = _node_id(tc.get("classname", ""), tc.get("name", ""))
+        detail_el = failure_el if failure_el is not None else error_el
+        message = detail_el.get("message", "") if detail_el is not None else ""
+        failures.append(FailureLocation(identity=node_id, file=None, message=message or ""))
 
-    detail = f"{passed} passed, {failures} failed, {errors} errors, {skipped} skipped"
-    if failed_names:
-        detail += "\nfailed: " + ", ".join(failed_names[:10])
+    detail = f"{passed} passed, {failures_count} failed, {errors} errors, {skipped} skipped"
+    if failures:
+        detail += "\nfailed: " + ", ".join(f.identity for f in failures[:10])
 
-    status = GateStatus.FAIL if (failures or errors) else GateStatus.PASS
-    return detail, status
+    status = GateStatus.FAIL if (failures_count or errors) else GateStatus.PASS
+    return detail, status, failures
 
 
 class JestRunner:
@@ -105,7 +136,7 @@ class JestRunner:
         command = ["npx", "--no-install", "jest", "--json", f"--outputFile={report_path}"]
         try:
             result = exec_command(command, cwd=worktree)
-            detail, status = _parse_jest(report_path, fallback=result.stdout + result.stderr)
+            detail, status, failures = _parse_jest(report_path, fallback=result.stdout + result.stderr)
         finally:
             Path(report_path).unlink(missing_ok=True)
 
@@ -118,21 +149,39 @@ class JestRunner:
             detail=detail,
             command=" ".join(command),
             exit_code=result.returncode,
+            failures=failures,
         )
 
 
-def _parse_jest(report_path: str, fallback: str) -> tuple[str, GateStatus | None]:
+def _parse_jest(
+    report_path: str, fallback: str
+) -> tuple[str, GateStatus | None, list[FailureLocation]]:
     try:
         data = json.loads(Path(report_path).read_text())
     except (json.JSONDecodeError, FileNotFoundError):
-        return tail(fallback), None
+        return tail(fallback), None, []
 
     passed = data.get("numPassedTests", 0)
     failed = data.get("numFailedTests", 0)
     total = data.get("numTotalTests", 0)
     detail = f"{passed}/{total} passed, {failed} failed"
+
+    failures: list[FailureLocation] = []
+    for result in data.get("testResults", []):
+        for assertion in result.get("assertionResults", []):
+            if assertion.get("status") != "failed":
+                continue
+            full_name = assertion.get("fullName") or assertion.get("title", "")
+            failures.append(
+                FailureLocation(
+                    identity=f"{result.get('name', '')}::{full_name}",
+                    file=result.get("name"),
+                    message="\n".join(assertion.get("failureMessages", [])),
+                )
+            )
+
     status = GateStatus.PASS if data.get("success") else GateStatus.FAIL
-    return detail, status
+    return detail, status, failures
 
 
 class GoTestRunner:
@@ -145,7 +194,7 @@ class GoTestRunner:
     def run(self, worktree: Path) -> Signal:
         command = ["go", "test", "-json", "./..."]
         result = exec_command(command, cwd=worktree)
-        detail, status = _parse_go_test(result.stdout, fallback=result.stdout + result.stderr)
+        detail, status, failures = _parse_go_test(result.stdout, fallback=result.stdout + result.stderr)
 
         if status is None:
             status = GateStatus.PASS if result.returncode == 0 else GateStatus.FAIL
@@ -156,12 +205,15 @@ class GoTestRunner:
             detail=detail,
             command=" ".join(command),
             exit_code=result.returncode,
+            failures=failures,
         )
 
 
-def _parse_go_test(stdout: str, fallback: str) -> tuple[str, GateStatus | None]:
+def _parse_go_test(
+    stdout: str, fallback: str
+) -> tuple[str, GateStatus | None, list[FailureLocation]]:
     passed = failed = 0
-    failed_names: list[str] = []
+    failures: list[FailureLocation] = []
     saw_any = False
     for line in stdout.splitlines():
         try:
@@ -175,15 +227,18 @@ def _parse_go_test(stdout: str, fallback: str) -> tuple[str, GateStatus | None]:
             passed += 1
         else:
             failed += 1
-            failed_names.append(f"{event.get('Package', '')}.{event['Test']}")
+            package = event.get("Package", "")
+            failures.append(
+                FailureLocation(identity=f"{package}.{event['Test']}", file=package)
+            )
 
     if not saw_any:
-        return tail(fallback), None
+        return tail(fallback), None, []
 
     detail = f"{passed} passed, {failed} failed"
-    if failed_names:
-        detail += "\nfailed: " + ", ".join(failed_names[:10])
-    return detail, (GateStatus.FAIL if failed else GateStatus.PASS)
+    if failures:
+        detail += "\nfailed: " + ", ".join(f.identity for f in failures[:10])
+    return detail, (GateStatus.FAIL if failed else GateStatus.PASS), failures
 
 
 def _load_json(path: Path) -> dict[str, object]:
