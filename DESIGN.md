@@ -814,3 +814,226 @@ end-to-end:
   hard task count equally. Difficulty-weighting is a suite-design concern
   that belongs with Phase 5's suite format, not this phase's aggregation
   math.
+
+---
+
+## Phase 4 — Frontend Truth
+
+## The goal, restated
+
+Every phase through Phase 3 verifies a repo through its command line —
+tests, typecheck, build, lint. None of that touches what an actual user
+sees. A change can pass every one of those gates and still ship a CTA
+button that's invisible, or a click that goes nowhere: `frontend/` closes
+that gap by driving the repo's own dev server in a real headless browser
+(Playwright) and grading what's actually rendered, in the same
+proven-vs-judged discipline as everything else. The hard constraint,
+directly from the brief: **a run that passes every test but fails a proven
+frontend check is NOT DONE** — a frontend regression has to be exactly as
+disqualifying as a broken test, never a lesser, advisory concern.
+
+## Four checks, in decreasing order of trust
+
+```text
+DOM assertion         PROVEN   the intended change reached the rendered DOM
+Interaction drive      PROVEN   the real user action produces the real outcome
+Perceptual screenshot  PROVEN   before/after render diff, thresholded not raw-pixel
+Vision-intent judge    JUDGED   a vision model's opinion — advisory, never load-bearing
+```
+
+`schema.py` needed **zero migration** for this — exactly as Phase 0's
+design promised. Every one of these is just a `Signal` with a
+`frontend:<kind>:<check-name>` name; the first three set
+`provenance=PROVEN`, the last sets `provenance=JUDGED`.
+`Verdict.status` already only ever consults PROVEN signals (see Phase 0's
+section above), so "a passing vision judgment can't rescue a failing DOM
+check" and "a failing vision judgment can't sink an otherwise-clean run"
+were both already true the moment these signals started flowing into the
+same `signals: list[Signal]` every other gate uses — no special-casing
+needed in `Verdict.status` for frontend signals specifically.
+
+## Config: `frontend.checks` in `verdict.yml`
+
+```yaml
+frontend:
+  start: "npm run dev"
+  url: "http://localhost:3000"
+  viewports: [1440, 375]
+  screenshot_threshold: 0.02        # fraction of pixels, not a raw count
+  checks:
+    - name: cta-visible-and-navigates
+      dom:
+        selector: "#cta"
+        visible: true
+        class_contains: "cta"
+      interaction:
+        click: "#cta"
+        expect_url_contains: "/signup"
+      vision_intent: "A prominent CTA button is visible above the fold."
+```
+
+`DomSpec`/`InteractionSpec`/`FrontendCheckSpec` (`config.py`) are
+deliberately narrow — selector existence/visibility/class/attribute/text
+for DOM, one click plus an expected URL substring or a newly-visible
+selector for interaction. Nothing here reaches into computed layout,
+pixel positions, or accessibility trees beyond what Playwright's own
+`is_visible()`/`get_attribute()` expose — the same "only what's
+mechanically checkable" discipline Phase 1's gate parsers used.
+
+## Where "before" actually comes from
+
+The visual-diff check needs a real pre-agent render to diff against, not a
+guess from source. `frontend/runner.py::_capture_before` gets one by
+reusing `worktree.py`'s `scratch_worktree(repo, worktree.base_commit)` —
+the same detached-checkout primitive Phase 2's bisection already uses to
+explore arbitrary commits — to spin up a second, disposable checkout
+pinned at the worktree's recorded `base_commit`, vendor its `node_modules`
+the same way the main worktree's are (`copy_vendored_dependencies`, moved
+into `worktree.py` this phase so both call sites share it), start the
+*same* `frontend.start` command against it, and screenshot every
+configured viewport. That server is torn down before the "after" server
+(against the agent's actual final worktree) starts — same port, so they
+can never run concurrently — and its screenshots feed straight into
+`visual_diff.perceptual_diff_ratio` against the "after" set. This is why
+the diff is trustworthy: both renders come from the same browser, same
+code path, same viewport — the only variable is the four extra digits of
+git history between `base_commit` and the agent's final commit.
+
+## Why frontend signals are never bisected
+
+`runner.py` appends frontend signals to `signals` *after* calling
+`attribute_failures`, not before. `attribution/engine.py`'s bisector calls
+`gates/registry.py::resolve_gate(gate, ...)` at each candidate commit, and
+`GATE_RUNNERS` only has four keys (`test`/`typecheck`/`build`/`lint`) —
+handing it `"frontend:dom:cta"` would be a `KeyError`, not a graceful
+"can't attribute this." Rather than teach the bisector a fifth gate
+category it doesn't actually know how to re-run standalone (a frontend
+check needs a live dev server up, not just a `subprocess.run`), Phase 4
+scopes causal attribution to the four gates it already covers and lets
+frontend failures show up as ungrouped `Signal`s — still fully counted by
+`Verdict.status`, just without a "which file caused this" sentence yet.
+Extending bisection to frontend checks is future work, not a correctness
+gap in what's shipped: the failure is real and reported either way.
+
+## Flakiness handling
+
+A browser-driven check has more ways to flake than a `pytest` run —
+network timing, port races, font rendering, transient websocket
+connections — and "flaky" here would mean the single worst thing a
+verdict tool can do: report NOT_DONE (or DONE) by accident. Four concrete
+defenses, each scoped to a specific flake source:
+
+1. **Readiness polling, not a fixed sleep.** `frontend/server.py::dev_server`
+   polls the configured `url` every 250ms (capped by
+   `frontend.ready_timeout_seconds`) rather than sleeping a guessed
+   duration before assuming the server is up — a `sleep(2)` either wastes
+   time on a fast server or races a slow one. Polling also distinguishes
+   two failure shapes that need different messages: the process **exited**
+   before answering (a real crash — surfaced with the process's own log
+   tail) versus it **never answered in time** (a hang or a wrong URL).
+2. **Process-group teardown.** `dev_server` starts the command with
+   `start_new_session=True` and kills the whole process group (`SIGTERM`,
+   then `SIGKILL` after a grace period) on the way out. A dev server
+   launched via `npm run dev` typically forks a real child (node); killing
+   only the shell would leave that child bound to the port, silently
+   breaking the *next* run's readiness poll with a stale listener. Every
+   `dev_server` context guarantees the port is free when it exits, success
+   or exception.
+3. **`networkidle` is a best-effort grace period, not a requirement.**
+   `_goto` navigates with `wait_until="load"`, then tries
+   `wait_for_load_state("networkidle", timeout=2000)` and swallows a
+   timeout rather than propagating it. A strict `networkidle` wait would
+   hang indefinitely against any dev server that keeps a persistent
+   connection open (hot-module-reload websockets are the common case) —
+   exactly the kind of real-world dev server behavior that would make
+   every check against a Vite/webpack-dev-server app flake or hang. Two
+   seconds of "let things settle if they're going to" is enough for a
+   screenshot to reflect a rendered page without staking correctness on a
+   condition modern dev tooling routinely never satisfies.
+4. **Perceptual, thresholded visual diff — not raw pixels.** This is the
+   biggest flake source a naive implementation would have shipped:
+   comparing screenshots byte-for-byte (or even pixel-for-pixel) would
+   flake on font hinting and anti-aliasing jitter alone, on a page nobody
+   touched. `visual_diff.py` downscales both renders to a fixed small size
+   *and* ignores any single pixel's grayscale delta under
+   `PIXEL_TOLERANCE` (30/255) before computing the changed-pixel ratio —
+   see that module's docstring for the full reasoning. The ratio, not a
+   raw count, is what's compared against `frontend.screenshot_threshold`,
+   so the same config value is meaningful at 1440px and at 375px. Verified
+   directly in `test_visual_diff.py`: identical images diff to exactly
+   `0.0`, and a 5/255 delta (representative render noise) also diffs to
+   `0.0`, while a real content change (black vs. white) diffs to `~1.0`.
+5. **Bounded interaction timeouts that fail loudly.** `checks.py` gives
+   clicks and post-click assertions a fixed 5s budget
+   (`INTERACTION_TIMEOUT_MS`) — long enough for a real click/navigation,
+   short enough that a genuinely broken interaction reports FAIL in
+   seconds rather than hanging the whole run.
+
+**What Phase 4 deliberately does not do about flakiness.** No automatic
+retry-on-failure for frontend checks specifically, and no multi-run
+variance measurement — both are the README roadmap's own next item
+("Flakiness detection: multi-seed variance, confidence intervals on
+pass-rate"), scoped out here for the same reason Phase 3 scoped out a
+retry *strategy* beyond "try again from scratch": designing a general
+flakiness-confidence model is a project of its own, and folding it into
+Phase 4 under a different name would mean building Phase 5-or-later
+without it getting to define its own shape. Every defense above targets a
+*specific, named* flake source with a concrete mechanism — there's no
+blanket "just retry until it passes," which would quietly convert a real
+intermittent bug into a passing verdict.
+
+## `VisionJudge`: pluggable, and honestly a stub today
+
+`frontend/vision_judge.py` defines `VisionJudge` as a `Protocol` (`judge(
+screenshot_png, intent) -> VisionJudgment`) — the same shape as `Adapter`
+in `adapters/__init__.py`: one method, pluggable implementations, so
+`runner.py` never needs to know which concrete judge it's holding. Only
+`MockVisionJudge` ships, and it says so in its own rationale text rather
+than pretending to have inspected anything: it passes unconditionally,
+with a `detail` string that states plainly it has no way to actually see
+the image. Wiring up a real vision-model API is a real integration project
+(pick a vendor, handle auth, validate against real screenshots) — building
+an untested stub that pretends to call a real model would be strictly
+worse than an honest, documented Mock, the same call Phase 0 made for
+`MockAdapter` on the agent side.
+
+## Demo repo
+
+`examples/sample_frontend_repo/` — a zero-npm-dependency static site (a
+~40-line `http.createServer` in `server.js`, so `--repo` works with no
+`npm install` step at all) with one seeded bug: `public/index.html`'s CTA
+link carries a leftover `hidden` CSS class from an earlier draft, so
+`#cta` never renders even though clicking it is supposed to navigate to
+`/signup.html`. `verdict.yml` configures one `FrontendCheckSpec` combining
+all three PROVEN checks plus a `vision_intent` string. `--agent mock`
+works out of the box (`cli.py`'s `_MOCK_PATCHES` ships the fix); run
+against the unfixed repo, `frontend:dom:cta-visible-and-navigates` and
+`frontend:interaction:cta-visible-and-navigates` both FAIL — while
+`frontend:visual_diff` still PASSes (a hidden element contributes ~0% to
+a perceptual diff) and the JUDGED vision signal still PASSes (`MockVisionJudge`
+always does) — and `Verdict.status` is still correctly `NOT_DONE`,
+demonstrating the brief's exact scenario: proven checks fail, judged
+opinion doesn't matter, done.
+
+## What's explicitly out of scope for Phase 4
+
+- **No causal attribution for frontend failures** — see above; scoped to
+  the four gates `attribution/engine.py` already covers.
+- **No flakiness/variance detection** — see above; that's the README
+  roadmap's own next item, not folded in here under a different name.
+- **DOM/interaction checks run once, at the first configured viewport**,
+  not once per viewport — only the perceptual screenshot diff is per-
+  viewport. Responsive *rendering* is checked at every configured width;
+  responsive *interaction behavior* (e.g. a mobile hamburger menu behaving
+  differently from a desktop nav) is not, and would need its own
+  per-viewport check plumbing.
+- **No real vision-model integration** — see `VisionJudge` above.
+- **No parallel viewport/browser execution** — screenshots and checks run
+  sequentially against one Chromium instance. Real, but bounded, added
+  latency per run; parallelizing across viewports is a performance
+  optimization that doesn't change what gets verified.
+- **A single dev-server command, not a build-then-serve pipeline** —
+  `frontend.start` is trusted to bring up something Playwright can hit;
+  Verdict doesn't orchestrate a separate build step first. A repo whose
+  dev server requires a prior build should say so in its own `start`
+  command (e.g. `"npm run build && npm run preview"`).
