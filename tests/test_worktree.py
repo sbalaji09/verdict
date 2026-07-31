@@ -31,10 +31,9 @@ def test_worktree_is_isolated_from_source_repo(git_repo: Path) -> None:
 
 def test_worktree_cleans_up_even_if_body_raises(git_repo: Path) -> None:
     captured_path = None
-    with pytest.raises(RuntimeError):
-        with isolated_worktree(git_repo) as wt:
-            captured_path = wt.path
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), isolated_worktree(git_repo) as wt:
+        captured_path = wt.path
+        raise RuntimeError("boom")
 
     assert captured_path is not None
     assert not captured_path.exists()
@@ -43,9 +42,8 @@ def test_worktree_cleans_up_even_if_body_raises(git_repo: Path) -> None:
 def test_isolated_worktree_rejects_non_git_dir(tmp_path: Path) -> None:
     not_a_repo = tmp_path / "plain"
     not_a_repo.mkdir()
-    with pytest.raises(WorktreeError):
-        with isolated_worktree(not_a_repo):
-            pass
+    with pytest.raises(WorktreeError), isolated_worktree(not_a_repo):
+        pass
 
 
 def test_diff_against_base_reports_changed_files(git_repo: Path) -> None:
