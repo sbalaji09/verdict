@@ -6,6 +6,12 @@ repo's object store (no copying gigabytes of history) while still giving the
 agent a fully independent directory and index to mutate. Each attempt gets
 its own throwaway branch off the current HEAD, and both the branch and the
 directory are removed on cleanup, success or failure.
+
+This module also carries the small git plumbing helpers Phase 2's
+attribution engine needs (commit ladders, detached scratch checkouts,
+cherry-picking a single path's content from another commit) — they're
+generic git operations, not attribution-specific logic, so they live next
+to the isolation primitive they're built on rather than in `attribution/`.
 """
 
 from __future__ import annotations
@@ -28,6 +34,11 @@ class WorktreeError(RuntimeError):
 class Worktree:
     path: Path
     branch: str
+    base_commit: str
+    """The commit the worktree branched from — i.e. the repo's state
+    *before* the agent touched anything. Attribution needs this to check
+    whether a failure already existed prior to the attempt.
+    """
 
 
 def _run_git(*args: str, cwd: Path) -> str:
@@ -57,40 +68,111 @@ def _assert_is_git_repo(repo: Path) -> None:
         raise WorktreeError(f"not a git repository: {repo}")
 
 
-def diff_against_base(worktree_path: Path) -> tuple[str, list[str]]:
+def run_git(*args: str, cwd: Path) -> str:
+    """Public escape hatch for git plumbing this module doesn't already
+    wrap (e.g. `git bisect start/bad/good`) — same error handling as the
+    internal helper, exposed for `attribution/` to build on.
+    """
+    return _run_git(*args, cwd=cwd)
+
+
+def rev_parse(repo: Path, ref: str) -> str:
+    return _run_git("rev-parse", ref, cwd=repo).strip()
+
+
+def diff_against_base(worktree_path: Path, base_commit: str) -> tuple[str, list[str]]:
     """Capture everything an agent changed in `worktree_path` relative to
-    the commit it started from — staged, unstaged, and committed on the
-    throwaway branch alike — as a unified diff plus a file list.
+    `base_commit` — staged, unstaged, and committed on the throwaway branch
+    alike — as a unified diff plus a file list.
+
+    Diffs against the recorded base commit, not `HEAD`: if the agent made
+    real commits during its run, `HEAD` has moved to point at them, and a
+    naive `diff --cached HEAD` would only see trailing uncommitted scraps
+    and silently miss everything already committed.
     """
     _run_git("add", "-A", cwd=worktree_path)
-    diff = _run_git("diff", "--cached", "HEAD", cwd=worktree_path)
-    files_raw = _run_git(
-        "diff", "--cached", "--name-only", "HEAD", cwd=worktree_path
-    )
+    diff = _run_git("diff", "--cached", base_commit, cwd=worktree_path)
+    files_raw = _run_git("diff", "--cached", "--name-only", base_commit, cwd=worktree_path)
     files = [f for f in files_raw.splitlines() if f]
     return diff, files
 
 
+def commit_all(worktree_path: Path, message: str) -> str:
+    """Stage and commit everything currently in the worktree (including
+    uncommitted agent edits), then return the resulting commit SHA. A no-op
+    (returns the current HEAD SHA unchanged) if there's nothing to commit —
+    e.g. the agent already committed everything itself.
+    """
+    _run_git("add", "-A", cwd=worktree_path)
+    status = _run_git("status", "--porcelain", cwd=worktree_path)
+    if status.strip():
+        _run_git("commit", "-q", "-m", message, cwd=worktree_path)
+    return rev_parse(worktree_path, "HEAD")
+
+
+def commits_between(repo: Path, base: str, final: str) -> list[str]:
+    """Real commits the agent made, oldest first. Empty if `final` has no
+    commits beyond `base` (e.g. everything was captured in one
+    `commit_all` call with nothing pre-committed by the agent).
+    """
+    if base == final:
+        return []
+    out = _run_git("rev-list", "--reverse", f"{base}..{final}", cwd=repo)
+    return [line for line in out.splitlines() if line]
+
+
+def parent_commit(repo: Path, sha: str) -> str:
+    return rev_parse(repo, f"{sha}^")
+
+
+def changed_files(repo: Path, a: str, b: str) -> list[str]:
+    out = _run_git("diff", "--name-only", a, b, cwd=repo)
+    return [line for line in out.splitlines() if line]
+
+
+def checkout_path_from(worktree_path: Path, commit: str, path: str) -> bool:
+    """Overwrite `path` in `worktree_path` with its content at `commit`,
+    handling the case where `path` doesn't exist at `commit` (i.e. it was
+    deleted there) by removing it instead. Returns True if the resulting
+    working tree differs from before the call (so callers can skip an
+    empty commit).
+    """
+    exists_at_commit = (
+        subprocess.run(
+            ["git", "cat-file", "-e", f"{commit}:{path}"],
+            cwd=worktree_path, capture_output=True,
+        ).returncode == 0
+    )
+    if exists_at_commit:
+        _run_git("checkout", commit, "--", path, cwd=worktree_path)
+    elif (worktree_path / path).exists():
+        _run_git("rm", "-q", "-f", path, cwd=worktree_path)
+    else:
+        return False
+    return True
+
+
 @contextmanager
-def isolated_worktree(repo: Path) -> Iterator[Worktree]:
-    """Check out `repo`'s HEAD into a fresh temp directory on a throwaway
+def isolated_worktree(repo: Path, ref: str = "HEAD") -> Iterator[Worktree]:
+    """Check out `repo` at `ref` into a fresh temp directory on a throwaway
     branch, yield it, then remove both — regardless of what happens inside.
     """
     repo = repo.resolve()
     _assert_is_git_repo(repo)
 
+    base_commit = rev_parse(repo, ref)
     run_id = uuid.uuid4().hex[:8]
     branch = f"verdict/{run_id}"
     parent_dir = Path(tempfile.mkdtemp(prefix="verdict-worktree-"))
     worktree_path = parent_dir / "worktree"
 
     _run_git(
-        "worktree", "add", "-b", branch, str(worktree_path), "HEAD",
+        "worktree", "add", "-b", branch, str(worktree_path), base_commit,
         cwd=repo,
     )
 
     try:
-        yield Worktree(path=worktree_path, branch=branch)
+        yield Worktree(path=worktree_path, branch=branch, base_commit=base_commit)
     finally:
         subprocess.run(
             ["git", "worktree", "remove", "--force", str(worktree_path)],
@@ -100,6 +182,33 @@ def isolated_worktree(repo: Path) -> Iterator[Worktree]:
         )
         subprocess.run(
             ["git", "branch", "-D", branch],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        shutil.rmtree(parent_dir, ignore_errors=True)
+
+
+@contextmanager
+def scratch_worktree(repo: Path, ref: str) -> Iterator[Path]:
+    """A detached-HEAD worktree at `ref`, with no throwaway branch of its
+    own. Used for attribution's disposable bisection checkouts — detached
+    so multiple scratch worktrees can each explore commits freely (moving
+    their own detached HEAD around, as `git bisect` does) without
+    colliding on branch names or on `isolated_worktree`'s branch, which may
+    already be checked out elsewhere for the same run.
+    """
+    repo = repo.resolve()
+    parent_dir = Path(tempfile.mkdtemp(prefix="verdict-scratch-"))
+    worktree_path = parent_dir / "scratch"
+
+    _run_git("worktree", "add", "--detach", str(worktree_path), ref, cwd=repo)
+
+    try:
+        yield worktree_path
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(worktree_path)],
             cwd=repo,
             capture_output=True,
             text=True,

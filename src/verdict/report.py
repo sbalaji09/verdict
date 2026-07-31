@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from verdict.schema import Confidence, GateStatus, Provenance, Verdict, VerdictStatus
+from verdict.schema import AttributionKind, Confidence, GateStatus, Provenance, Verdict, VerdictStatus
 
 console = Console()
 
@@ -22,6 +22,12 @@ _VERDICT_STYLE = {
     VerdictStatus.DONE: ("bold green", "DONE"),
     VerdictStatus.NOT_DONE: ("bold red", "NOT DONE"),
     VerdictStatus.UNVERIFIED: ("bold yellow", "UNVERIFIED"),
+}
+
+_ATTRIBUTION_MARK = {
+    AttributionKind.REGRESSION: "[red]✗[/red]",
+    AttributionKind.PRE_EXISTING: "[yellow]~[/yellow]",
+    AttributionKind.INCONCLUSIVE: "[dim]?[/dim]",
 }
 
 
@@ -53,6 +59,13 @@ def render(verdict: Verdict) -> None:
         for s in judged:
             mark = "[green]~[/green]" if s.status is GateStatus.PASS else "[yellow]~[/yellow]"
             console.print(f"  {mark} {s.name:<12}  {s.detail}")
+        console.print()
+
+    if verdict.attributions:
+        console.print("[bold]CAUSAL ANALYSIS[/bold] [dim](proven — bisection, not opinion)[/dim]")
+        for a in verdict.attributions:
+            mark = _ATTRIBUTION_MARK[a.kind]
+            console.print(f"  {mark} {a.explanation}")
         console.print()
 
     if verdict.attempt.cost_usd is not None:

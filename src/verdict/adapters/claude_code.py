@@ -14,7 +14,6 @@ import subprocess
 from pathlib import Path
 
 from verdict.schema import AttemptResult
-from verdict.worktree import diff_against_base
 
 # Generous: real coding tasks can involve many tool calls and file reads.
 DEFAULT_TIMEOUT_SECONDS = 900
@@ -81,11 +80,11 @@ class ClaudeCodeAdapter:
         cost_usd = payload.get("total_cost_usd")
         raw_result = payload.get("result")
 
-        diff, files_changed = diff_against_base(worktree)
-
+        # diff/files_changed are filled in by runner.py, which knows the
+        # worktree's base commit.
         return AttemptResult(
-            diff=diff,
-            files_changed=files_changed,
+            diff="",
+            files_changed=[],
             tokens_input=_as_int(usage.get("input_tokens")),
             tokens_output=_as_int(usage.get("output_tokens")),
             cost_usd=cost_usd if isinstance(cost_usd, (int, float)) else None,

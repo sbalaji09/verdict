@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -7,9 +8,7 @@ import pytest
 from verdict.adapters.mock import MockAdapter
 
 
-def test_mock_adapter_writes_patches_and_reports_diff(tmp_path: Path) -> None:
-    import subprocess
-
+def test_mock_adapter_writes_patches(tmp_path: Path) -> None:
     repo = tmp_path
     (repo / "a.py").write_text("old\n")
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
@@ -22,8 +21,8 @@ def test_mock_adapter_writes_patches_and_reports_diff(tmp_path: Path) -> None:
     result = adapter.run("some task", repo)
 
     assert (repo / "a.py").read_text() == "new\n"
-    assert result.files_changed == ["a.py"]
-    assert "new" in result.diff
+    # diff/files_changed are filled in later by runner.py, not the adapter
+    assert result.files_changed == []
     assert result.cost_usd == 0.0
 
 

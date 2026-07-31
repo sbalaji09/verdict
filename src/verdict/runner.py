@@ -8,10 +8,11 @@ import shutil
 from pathlib import Path
 
 from verdict.adapters import Adapter
+from verdict.attribution.engine import attribute_failures
 from verdict.config import load_config
 from verdict.gates.registry import run_all_gates
 from verdict.schema import Verdict
-from verdict.worktree import isolated_worktree
+from verdict.worktree import commit_all, diff_against_base, isolated_worktree
 
 # Dependency directories that live outside git (installed, not committed —
 # correctly so) but that build/typecheck/lint gates need present to run at
@@ -44,8 +45,19 @@ def run(
     with isolated_worktree(repo) as worktree:
         _copy_vendored_dependencies(repo, worktree.path)
         attempt = adapter.run(task, worktree.path)
+        diff, files_changed = diff_against_base(worktree.path, worktree.base_commit)
+        attempt = attempt.model_copy(update={"diff": diff, "files_changed": files_changed})
+
+        # Commit the agent's work now, before any gate runs — gates (pytest,
+        # mypy, ...) can leave their own artifacts (__pycache__, etc.) in the
+        # worktree as a side effect of executing, and attribution's bisection
+        # must never mistake a gate's own byproduct for something the agent
+        # changed. `attempt_commit` is what attribution treats as "final".
+        attempt_commit = commit_all(worktree.path, "verdict: attempt final state")
+
         config = load_config(worktree.path)
         signals = run_all_gates(worktree.path, config)
+        attributions = attribute_failures(repo, worktree, attempt_commit, signals)
 
     return Verdict(
         task=task,
@@ -53,4 +65,5 @@ def run(
         repo=str(repo),
         attempt=attempt,
         signals=signals,
+        attributions=attributions,
     )

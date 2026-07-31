@@ -12,7 +12,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from verdict.schema import AttemptResult
-from verdict.worktree import diff_against_base
 
 
 class MockAdapter:
@@ -31,10 +30,12 @@ class MockAdapter:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(contents)
 
-        diff, files_changed = diff_against_base(worktree)
+        # diff/files_changed are filled in by runner.py, which knows the
+        # worktree's base commit — an adapter shouldn't need to know about
+        # git diffing to do its one job (edit files).
         return AttemptResult(
-            diff=diff,
-            files_changed=files_changed,
+            diff="",
+            files_changed=[],
             tokens_input=0,
             tokens_output=0,
             cost_usd=0.0,
