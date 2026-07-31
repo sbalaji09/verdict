@@ -219,3 +219,111 @@ class Verdict(BaseModel):
         if test_signal is None or test_signal.status is GateStatus.NA:
             return Confidence.LOW
         return Confidence.HIGH
+
+
+class TaskRun(BaseModel):
+    """The result of attempting one task, possibly across several retries.
+    Cost is accounted across *every* attempt, not just the last — a dead
+    end still spent real tokens, and reporting only the winning attempt's
+    cost would understate what the task actually took.
+    """
+
+    task: str
+    agent: str
+    repo: str
+    attempts: list[Verdict]
+
+    @property
+    def final(self) -> Verdict:
+        """The attempt that decides done/not-done: the first DONE one if
+        there was one, otherwise the last attempt made (run_with_retries
+        stops early on DONE, so in practice this is just `attempts[-1]`)."""
+        return self.attempts[-1]
+
+    @property
+    def done(self) -> bool:
+        return self.final.done
+
+    @property
+    def attempt_count(self) -> int:
+        return len(self.attempts)
+
+    @property
+    def failed_attempt_count(self) -> int:
+        return sum(1 for v in self.attempts if not v.done)
+
+    @property
+    def total_tokens_input(self) -> int:
+        return sum(v.attempt.tokens_input for v in self.attempts)
+
+    @property
+    def total_tokens_output(self) -> int:
+        return sum(v.attempt.tokens_output for v in self.attempts)
+
+    @property
+    def total_cost_usd(self) -> float | None:
+        """None if *any* attempt's cost is unknown — summing the attempts
+        that do have a figure and calling that "total" would understate
+        the real number while looking precise. Better to say "unknown."
+        """
+        total = 0.0
+        for v in self.attempts:
+            if v.attempt.cost_usd is None:
+                return None
+            total += v.attempt.cost_usd
+        return total
+
+
+class ConfigResult(BaseModel):
+    """One (agent, config) combination's aggregate result across a set of
+    tasks — the unit a leaderboard ranks. "config" is a free-form label the
+    caller supplies (e.g. "claude-code / sonnet" vs "claude-code / opus");
+    Verdict doesn't need to understand what varies to compare their
+    economics.
+    """
+
+    label: str
+    task_runs: list[TaskRun]
+
+    @property
+    def tasks_total(self) -> int:
+        return len(self.task_runs)
+
+    @property
+    def tasks_done(self) -> int:
+        return sum(1 for t in self.task_runs if t.done)
+
+    @property
+    def pass_rate(self) -> float:
+        if not self.task_runs:
+            return 0.0
+        return self.tasks_done / self.tasks_total
+
+    @property
+    def total_cost_usd(self) -> float | None:
+        total = 0.0
+        for t in self.task_runs:
+            cost = t.total_cost_usd
+            if cost is None:
+                return None
+            total += cost
+        return total
+
+    @property
+    def total_tokens_input(self) -> int:
+        return sum(t.total_tokens_input for t in self.task_runs)
+
+    @property
+    def total_tokens_output(self) -> int:
+        return sum(t.total_tokens_output for t in self.task_runs)
+
+    @property
+    def pass_rate_per_dollar(self) -> float | None:
+        """"verdict-pts/$" — one verdict point per task confirmed DONE.
+        None when cost is unknown (never divide by a guess) or zero (zero
+        spend with zero done tasks is undefined, not infinitely good).
+        """
+        cost = self.total_cost_usd
+        if cost is None or cost <= 0:
+            return None
+        return self.tasks_done / cost

@@ -8,8 +8,8 @@ import typer
 from verdict.adapters import Adapter
 from verdict.adapters.claude_code import ClaudeCodeAdapter, ClaudeCodeAdapterError
 from verdict.adapters.mock import MockAdapter
-from verdict.report import render
-from verdict.runner import run
+from verdict.report import render_task_run
+from verdict.runner import run_with_retries
 from verdict.worktree import WorktreeError
 
 app = typer.Typer(add_completion=False, help="Grade AI coding agents on executable truth.")
@@ -58,21 +58,32 @@ def run_cmd(
     task: str = typer.Option(..., "--task", help="Natural-language description of the work."),
     agent: str = typer.Option(..., "--agent", help="Which adapter to drive: mock | claude-code"),
     repo: Path = typer.Option(..., "--repo", help="Path to a git repository to grade against."),
+    max_attempts: int = typer.Option(
+        1,
+        "--max-attempts",
+        help=(
+            "Retry on failure up to this many times, stopping early on DONE. "
+            "Cost is tracked across every attempt, dead ends included. "
+            "Each retry re-runs the real agent — with --agent claude-code that's real spend."
+        ),
+    ),
 ) -> None:
-    """Run one agent attempt against one task and print its Verdict.
+    """Run an agent against one task (retrying on failure if --max-attempts > 1)
+    and print its Verdict plus the cost across every attempt made.
 
-    Gate commands are autodetected per-stack; override any of them with a
-    `verdict.yml` in the repo being graded (see README's Configuration section).
+    Gate commands are autodetected per-stack; override any of them — and
+    configure token pricing — with a `verdict.yml` in the repo being graded
+    (see README's Configuration section).
     """
     adapter = _build_adapter(agent, repo)
     try:
-        verdict = run(task=task, repo=repo, adapter=adapter)
+        task_run = run_with_retries(task=task, repo=repo, adapter=adapter, max_attempts=max_attempts)
     except (WorktreeError, ClaudeCodeAdapterError) as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
 
-    render(verdict)
-    if not verdict.done:
+    render_task_run(task_run)
+    if not task_run.done:
         sys.exit(1)
 
 

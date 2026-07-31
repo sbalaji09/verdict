@@ -9,10 +9,12 @@ from pathlib import Path
 
 from verdict.adapters import Adapter
 from verdict.attribution.engine import attribute_failures
-from verdict.config import load_config
+from verdict.config import VerdictConfig, load_config
 from verdict.gates.registry import run_all_gates
-from verdict.schema import Verdict
+from verdict.schema import AttemptResult, TaskRun, Verdict
 from verdict.worktree import commit_all, diff_against_base, isolated_worktree
+
+DEFAULT_MAX_ATTEMPTS = 1
 
 # Dependency directories that live outside git (installed, not committed —
 # correctly so) but that build/typecheck/lint gates need present to run at
@@ -56,6 +58,7 @@ def run(
         attempt_commit = commit_all(worktree.path, "verdict: attempt final state")
 
         config = load_config(worktree.path)
+        attempt = _apply_pricing_fallback(attempt, config)
         signals = run_all_gates(worktree.path, config)
         attributions = attribute_failures(repo, worktree, attempt_commit, signals)
 
@@ -67,3 +70,39 @@ def run(
         signals=signals,
         attributions=attributions,
     )
+
+
+def _apply_pricing_fallback(attempt: AttemptResult, config: VerdictConfig) -> AttemptResult:
+    """If the adapter didn't report its own cost (only ClaudeCodeAdapter
+    does today) but verdict.yml configures token pricing, compute it —
+    real spend is real spend whether or not the adapter happened to hand
+    back a dollar figure directly.
+    """
+    if attempt.cost_usd is not None or config.token_pricing is None:
+        return attempt
+    computed = config.token_pricing.cost_usd(attempt.tokens_input, attempt.tokens_output)
+    return attempt.model_copy(update={"cost_usd": computed})
+
+
+def run_with_retries(
+    task: str,
+    repo: Path,
+    adapter: Adapter,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> TaskRun:
+    """Attempt `task` up to `max_attempts` times, stopping early on the
+    first DONE. Every attempt is kept — including failed, abandoned ones —
+    so `TaskRun`'s cost accounting reflects what the task actually cost,
+    not just what the winning attempt cost.
+
+    Defaults to a single attempt: retries are opt-in. Each retry re-runs
+    the real adapter, which for `ClaudeCodeAdapter` means real spend —
+    Verdict shouldn't silently multiply a bill the caller didn't ask for.
+    """
+    attempts: list[Verdict] = []
+    for _ in range(max(max_attempts, 1)):
+        verdict = run(task=task, repo=repo, adapter=adapter)
+        attempts.append(verdict)
+        if verdict.done:
+            break
+    return TaskRun(task=task, agent=adapter.name, repo=str(repo), attempts=attempts)
