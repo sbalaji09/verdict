@@ -36,6 +36,25 @@ _MOCK_PATCHES: dict[str, dict[str, str]] = {
             "}\n"
         ),
     },
+    "sample_frontend_repo": {
+        "public/index.html": (
+            "<!doctype html>\n"
+            '<html lang="en">\n'
+            "<head>\n"
+            '  <meta charset="utf-8">\n'
+            "  <title>Acme Launch</title>\n"
+            '  <link rel="stylesheet" href="/style.css">\n'
+            "</head>\n"
+            "<body>\n"
+            "  <header><h1>Acme</h1></header>\n"
+            "  <main>\n"
+            "    <p>The fastest way to launch your next idea.</p>\n"
+            '    <a id="cta" class="cta" href="/signup.html">Get Started</a>\n'
+            "  </main>\n"
+            "</body>\n"
+            "</html>\n"
+        ),
+    },
 }
 
 
