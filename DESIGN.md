@@ -832,25 +832,29 @@ directly from the brief: **a run that passes every test but fails a proven
 frontend check is NOT DONE** — a frontend regression has to be exactly as
 disqualifying as a broken test, never a lesser, advisory concern.
 
-## Four checks, in decreasing order of trust
+## Five checks, in decreasing order of trust
 
 ```text
-DOM assertion         PROVEN   the intended change reached the rendered DOM
-Interaction drive      PROVEN   the real user action produces the real outcome
-Perceptual screenshot  PROVEN   before/after render diff, thresholded not raw-pixel
-Vision-intent judge    JUDGED   a vision model's opinion — advisory, never load-bearing
+DOM assertion          PROVEN   the intended change reached the rendered DOM
+Interaction drive       PROVEN   the real user action produces the real outcome
+Perceptual screenshot   PROVEN   before/after render diff, thresholded not raw-pixel
+Glitch scan             PROVEN   frame-burst diffing catches transient flicker/never-settled
+Vision-intent judge     JUDGED   a vision model's opinion — advisory, never load-bearing
 ```
 
-`schema.py` needed **zero migration** for this — exactly as Phase 0's
-design promised. Every one of these is just a `Signal` with a
-`frontend:<kind>:<check-name>` name; the first three set
-`provenance=PROVEN`, the last sets `provenance=JUDGED`.
-`Verdict.status` already only ever consults PROVEN signals (see Phase 0's
-section above), so "a passing vision judgment can't rescue a failing DOM
-check" and "a failing vision judgment can't sink an otherwise-clean run"
-were both already true the moment these signals started flowing into the
-same `signals: list[Signal]` every other gate uses — no special-casing
-needed in `Verdict.status` for frontend signals specifically.
+Four of these needed **zero schema migration** — exactly as Phase 0's
+design promised: every one is just a `Signal` with a
+`frontend:<kind>:<check-name>` name, PROVEN for the first four, JUDGED for
+the last. `Verdict.status` already only ever consults PROVEN signals (see
+Phase 0's section above), so "a passing vision judgment can't rescue a
+failing DOM check" and "a failing vision judgment can't sink an otherwise-
+clean run" were both already true the moment these signals started
+flowing into the same `signals: list[Signal]` every other gate uses — no
+special-casing needed in `Verdict.status` for frontend signals
+specifically. The one genuinely additive field is `Signal.artifact_path`
+(optional, defaults to `None`) — added for the glitch scan's video
+recordings, see below; every existing `Signal` construction across every
+earlier phase is unaffected.
 
 ## Config: `frontend.checks` in `verdict.yml`
 
@@ -860,6 +864,10 @@ frontend:
   url: "http://localhost:3000"
   viewports: [1440, 375]
   screenshot_threshold: 0.02        # fraction of pixels, not a raw count
+  glitch_scan: true                 # on by default — see the Glitch scan section below
+  glitch_capture_seconds: 1.5
+  glitch_frame_interval_seconds: 0.15
+  glitch_diff_threshold: 0.05
   checks:
     - name: cta-visible-and-navigates
       dom:
@@ -915,6 +923,98 @@ frontend failures show up as ungrouped `Signal`s — still fully counted by
 Extending bisection to frontend checks is future work, not a correctness
 gap in what's shipped: the failure is real and reported either way.
 
+## Glitch scan: catching what a single before/after screenshot can't
+
+The perceptual visual-diff check compares exactly two moments — before the
+agent's change, after it. That's blind to anything that happens *between*
+those two moments: a flash of unstyled content on load, a modal that
+flickers open and immediately shut, a layout that jumps and jumps back,
+an animation that gets stuck instead of resolving. A regression that
+self-corrects within a second still shipped a visibly broken instant to a
+real user, and a single before/after screenshot pair structurally cannot
+see it — you'd need to happen to screenshot the exact glitching
+millisecond, which is exactly the kind of thing a fixed two-shot diff
+misses by construction.
+
+`frontend/capture.py` + `frontend/glitch.py` close that gap with a third,
+independent PROVEN check: a short burst of real screenshots (not a decoded
+video — see below), taken close together in time, compared frame-to-frame
+with the same `perceptual_diff_ratio` the before/after check already uses.
+Two burst windows run per check, each driven by `verdict.yml`'s
+`glitch_capture_seconds`/`glitch_frame_interval_seconds`/
+`glitch_diff_threshold`:
+
+- **Load burst** (`frontend:glitch_scan:load`) — captured immediately
+  after navigation, at the primary viewport, via
+  `capture.capture_settle_burst`.
+- **Interaction burst** (`frontend:glitch_scan:<check-name>`) — one frame
+  captured immediately before the click, then `interaction_check`'s click
+  and assertions run, then frames continue for the configured window, via
+  `capture.capture_action_burst`. The click happens exactly once — inside
+  the burst's own action callback — so the glitch scan and the interaction
+  check are two views of the *same* real click, not two separate
+  simulated ones.
+
+`glitch.py`'s `scan_for_glitches` looks for two distinct shapes a plain
+before/after diff can't distinguish, both computed purely from pairwise
+`perceptual_diff_ratio` calls over the burst:
+
+- **Flicker** — frame *i* differs sharply from both its neighbors, while
+  those neighbors closely resemble *each other*. That asymmetry (endpoints
+  agree, middle frame doesn't) is the signature of something that
+  appeared and reverted within roughly one capture interval — a diff
+  across the whole burst (frame 0 vs. frame N) would show ~0% change and
+  miss it entirely, the same blind spot the before/after check has, just
+  at a smaller time scale.
+- **Never settled** — the last two captured frames still differ beyond
+  threshold, meaning the page was still visibly changing at the end of the
+  capture window, when a well-behaved render or interaction is expected to
+  have reached a stable final state.
+
+Both are still PROVEN: every frame is a screenshot Playwright actually
+took, and every finding is arithmetic over those frames — no model, no
+opinion, fully reproducible given the same burst.
+
+**Video: real evidence, not synthesized.** Every page opened during a
+glitch scan is recorded with Playwright's own `record_video_dir` — a real
+`.webm` of the actual browser session, saved via
+`Browser.new_page(record_video_dir=...)` and finalized (per Playwright's
+own contract) once the page closes. This is deliberately *not* built by
+stitching the burst screenshots into a video ourselves — Playwright is
+already recording the real thing at its own native frame rate, so
+reconstructing a lower-fidelity video from our sparser diagnostic frames
+would be strictly worse evidence for a human reviewer, for no benefit to
+the automated detection (which only needs the burst, not the video).
+`Signal.artifact_path` carries the recording's path so a failing
+`frontend:glitch_scan:*` signal points straight at footage of the actual
+glitch — this is the one field Phase 4 added to the schema (see above).
+
+**Retention policy: keep evidence only when there's something to explain.**
+Recording every page is real disk cost, and most runs are clean. So
+`run_frontend_checks` records into one temp directory for the whole run,
+then deletes it in a `finally` block *unless* some PROVEN signal in the
+run failed — a clean run leaves nothing behind; a failing one keeps the
+whole capture directory (every page opened that run, not just the one
+specific page that failed) as surrounding context, which is simpler than
+cherry-picking a single file and still points a reviewer at real footage.
+A `PASS` glitch-scan signal never carries an `artifact_path` — even if its
+own recording happened to still exist as of that Signal being
+constructed, the run isn't over yet and the file may still be deleted
+before the caller ever looks, so the signal doesn't make a promise it
+can't keep.
+
+**Why not decode Playwright's own video for the automated detection
+instead of a separate screenshot burst?** Decoding a `.webm` back into
+frames means a real codec dependency (`opencv-python`, `ffmpeg`) for
+something a loop of `page.screenshot()` calls already provides directly,
+at the sample rate glitch detection actually needs (a handful of frames
+over ~1-2 seconds, not 30fps). The screenshot burst and the video
+recording run concurrently on the same page for the same reason DOM/
+interaction checks and gates coexist elsewhere in this codebase: each
+does the one job it's suited for — the burst feeds the deterministic
+PROVEN check, the video is for a human's eyes — without either one having
+to serve both purposes.
+
 ## Flakiness handling
 
 A browser-driven check has more ways to flake than a `pytest` run —
@@ -968,6 +1068,19 @@ defenses, each scoped to a specific flake source:
    (`INTERACTION_TIMEOUT_MS`) — long enough for a real click/navigation,
    short enough that a genuinely broken interaction reports FAIL in
    seconds rather than hanging the whole run.
+6. **Glitch-scan timing is honestly best-effort, and its threshold is a
+   separate config value from the visual diff's.** `capture.py`'s own
+   docstring states plainly that `interval_seconds` is a floor, not a
+   promise — each `page.screenshot()` call takes real, variable time on
+   top of the requested gap. That's acceptable for what glitch detection
+   needs (catching a state change within *roughly* one interval), but it
+   would not be acceptable if the same number were being used as a
+   precise timing budget elsewhere, which is why `glitch_diff_threshold`
+   is its own `verdict.yml` key rather than reusing
+   `screenshot_threshold` — frame-to-frame noise over a short interval and
+   whole-page noise over an entire edit are different enough
+   measurements that one config value tuned for one would either be too
+   strict or too loose for the other.
 
 **What Phase 4 deliberately does not do about flakiness.** No automatic
 retry-on-failure for frontend checks specifically, and no multi-run
@@ -1037,3 +1150,26 @@ opinion doesn't matter, done.
   Verdict doesn't orchestrate a separate build step first. A repo whose
   dev server requires a prior build should say so in its own `start`
   command (e.g. `"npm run build && npm run preview"`).
+- **The glitch scan cannot distinguish an intentional animation from a
+  real glitch.** A page with a genuine loading spinner, a deliberate CSS
+  transition, or a lazy-loaded image is *also* "still visibly changing" by
+  the same measurement an actual bug would trigger — `scan_for_glitches`
+  has no concept of design intent, only pixel change over time. This is a
+  real, known false-positive source, not an oversight: a repo with
+  legitimate ongoing motion on load should either raise
+  `glitch_diff_threshold`, extend `glitch_capture_seconds` past the
+  animation's own duration, or set `glitch_scan: false` for that check.
+  Teaching the scan to recognize "intentional" motion would mean either a
+  model's opinion (moving it out of the PROVEN bucket entirely) or a
+  taxonomy of animation patterns to special-case — neither is in scope
+  here.
+- **No video decoding for the automated detection** — see the glitch-scan
+  section above; the burst and the recording are two independent captures
+  of the same session, deliberately not derived from each other.
+- **One capture window per check, not adaptive retries.** If a burst
+  happens to under-sample a genuine flicker (bad luck on interval timing
+  against a very brief glitch), Phase 4 doesn't automatically lengthen the
+  window and try again — consistent with "no automatic retry-on-flake"
+  above. A repo with known brief glitches should tune
+  `glitch_frame_interval_seconds` down rather than rely on Verdict to
+  retry until it happens to catch one.

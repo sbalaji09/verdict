@@ -162,6 +162,7 @@ frontend:
   url:       "http://localhost:3000"
   viewports: [1440, 768, 375]     # responsive checks
   vision_model: "gpt-4-class"     # judged bucket only
+  glitch_scan: true               # frame-burst flicker/never-settled detection, video on failure
 
 cost:
   price_per_1k_tokens: { input: 0.003, output: 0.015 }
