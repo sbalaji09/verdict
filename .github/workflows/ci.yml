@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Verdict (dev + frontend extras)
+        run: pip install -e ".[dev]"
+
+      - name: Build the sandbox image
+        # GitHub-hosted Ubuntu runners ship Docker, so the
+        # `@pytest.mark.docker` adversarial containment tests
+        # (tests/test_sandbox_docker_adversarial.py) run for real here,
+        # not just as a skip — this is the one place they get exercised
+        # short of a local `docker build` + `pytest -m docker`.
+        run: docker build -t verdict-sandbox:0.1.0 .
+
+      - name: Install Playwright's Chromium (for frontend tests)
+        run: playwright install --with-deps chromium
+
+      - name: ruff
+        run: ruff check .
+
+      - name: mypy
+        run: mypy src
+
+      - name: pytest
+        run: pytest -q

@@ -1,9 +1,28 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+
+
+def _docker_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=10).returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if _docker_available():
+        return
+    skip_docker = pytest.mark.skip(reason="no reachable Docker daemon")
+    for item in items:
+        if "docker" in item.keywords:
+            item.add_marker(skip_docker)
 
 
 @pytest.fixture

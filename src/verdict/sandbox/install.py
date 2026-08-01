@@ -1,0 +1,56 @@
+"""A minimal, explicitly scoped dependency-install step: detect an install
+command, run it with network ON, in its own sandbox session separate from
+the one gates run in (which stays network OFF for the entire run — see
+`runner.py`).
+
+Deliberately minimal per Phase 8's scope (see DESIGN.md): detection only
+covers the common "no lockfile-free install directory present yet" case,
+just enough that `examples/sample_node_repo` can demo without a
+pre-vendored `node_modules`. Explicitly OUT of scope here, deferred to
+Phase 10: broader/more accurate autodetection, dependency caching across
+runs, resolving a repo's pinned language version (the fat image's
+`pyenv`/`nvm` exist for this, unused so far), and service dependencies
+(databases, etc.).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from pathlib import Path
+
+from verdict.sandbox.base import SandboxError
+from verdict.sandbox.config import SandboxConfig, create_sandbox
+
+
+def _detect_install_command(worktree: Path) -> list[str] | None:
+    """Only fires when the dependency directory looks genuinely absent —
+    if `copy_vendored_dependencies` (worktree.py) already populated one,
+    installing again would be redundant work this phase doesn't need to
+    do, and (for npm) can be slower/flakier than just using what's there.
+    """
+    if (worktree / "package.json").exists() and not (worktree / "node_modules").exists():
+        return ["npm", "install"]
+    if (worktree / "requirements.txt").exists() and not (worktree / ".venv").exists():
+        return ["pip", "install", "--user", "-r", "requirements.txt"]
+    if (worktree / "go.mod").exists() and not (worktree / "vendor").exists():
+        return ["go", "mod", "download"]
+    return None
+
+
+def run_install_step(worktree: Path, config: SandboxConfig) -> None:
+    """Best-effort: a missing tool or unreachable network here degrades to
+    "dependencies weren't installed," which gates downstream will then
+    honestly report as their own real failure (a missing binary, an import
+    error) — not something this step should hide by raising, but also not
+    something worth pretending succeeded.
+    """
+    command = _detect_install_command(worktree)
+    if command is None:
+        return
+
+    install_config = dataclasses.replace(config, network=True)
+    try:
+        with create_sandbox(worktree, install_config) as sandbox:
+            sandbox.exec(command, cwd=worktree, network=True, timeout_seconds=600)
+    except SandboxError:
+        return

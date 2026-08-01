@@ -43,6 +43,9 @@ exclude = ["examples/"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "docker: requires a reachable Docker daemon (auto-skipped otherwise, see tests/conftest.py)",
+]
 
 [tool.ruff]
 line-length = 110
