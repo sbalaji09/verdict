@@ -34,10 +34,10 @@ from verdict.pr_comment import build_comment_from_file
 from verdict.report import render_task_run
 from verdict.report_html import render_html
 from verdict.report_json import render_json
-from verdict.runner import grade_existing_diff, run_with_retries
+from verdict.runner import DEFAULT_MAX_ERROR_RETRIES, grade_existing_diff, run_with_retries
 from verdict.sandbox import ResourceLimits, SandboxConfig
 from verdict.sandbox.base import SandboxUnavailableError
-from verdict.schema import ConfigResult, TaskRun
+from verdict.schema import ConfigResult, TaskRun, VerdictStatus
 from verdict.suite import BenchConfig, SuiteLoadError, load_suite, run_suite
 from verdict.worktree import WorktreeError
 
@@ -264,9 +264,18 @@ def run_cmd(
         1,
         "--max-attempts",
         help=(
-            "Retry on failure up to this many times, stopping early on DONE. "
+            "Retry on a legitimate agent failure up to this many times, stopping early on DONE. "
             "Cost is tracked across every attempt, dead ends included. "
             "Each retry re-runs the real agent — with a real --agent that's real spend."
+        ),
+    ),
+    max_error_retries: int = typer.Option(
+        DEFAULT_MAX_ERROR_RETRIES,
+        "--max-error-retries",
+        help=(
+            "Separate from --max-attempts: how many times an infra failure (sandbox never came "
+            "up, a service never healthy, the adapter's own CLI crashed) is auto-retried before "
+            "being reported as ERROR. Never spent on a legitimate agent NOT_DONE."
         ),
     ),
     report: list[str] = typer.Option(["cli"], "--report", help=_REPORT_HELP),
@@ -312,18 +321,27 @@ def run_cmd(
         gate_timeout_seconds, provision_timeout_seconds, install_timeout_seconds, attempt_budget_seconds,
         health_timeout_seconds,
     )
-    try:
-        task_run = run_with_retries(
-            task=task, repo=repo, adapter=adapter, max_attempts=max_attempts, sandbox_config=sandbox_config
-        )
-    except _RUN_ERRORS as exc:
-        typer.secho(str(exc), fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
+    task_run = run_with_retries(
+        task=task,
+        repo=repo,
+        adapter=adapter,
+        max_attempts=max_attempts,
+        sandbox_config=sandbox_config,
+        max_error_retries=max_error_retries,
+    )
 
     if "cli" in report:
         render_task_run(task_run)
     _write_machine_reports(report, output_dir, [ConfigResult(label=agent, task_runs=[task_run])])
 
+    # ERROR (infra never evaluated the attempt) and NOT_DONE (evaluated,
+    # found wanting) are deliberately different exit codes — the same
+    # distinction `_RUN_ERRORS` used to draw by crashing with code 2
+    # before Phase 11 taught `run_with_retries` to retry-then-report ERROR
+    # instead. A CI script keying off exit code can still tell "the agent
+    # failed" (1) apart from "we couldn't tell" (2).
+    if task_run.final.status is VerdictStatus.ERROR:
+        sys.exit(2)
     if not task_run.done:
         sys.exit(1)
 
@@ -343,6 +361,15 @@ def bench_cmd(
     ),
     max_attempts: int = typer.Option(
         1, "--max-attempts", help="Retry each task up to this many times per config, stopping early on DONE."
+    ),
+    max_error_retries: int = typer.Option(
+        DEFAULT_MAX_ERROR_RETRIES,
+        "--max-error-retries",
+        help=(
+            "Separate from --max-attempts: how many times an infra failure is auto-retried per "
+            "(config, task) before that task is recorded as ERROR and excluded from the leaderboard's "
+            "pass-rate denominator."
+        ),
     ),
     report: list[str] = typer.Option(["cli"], "--report", help=_REPORT_HELP),
     output_dir: Path = typer.Option(
@@ -393,11 +420,13 @@ def bench_cmd(
         health_timeout_seconds,
     )
 
-    try:
-        results = run_suite(tasks, configs, max_attempts=max_attempts, sandbox_config=sandbox_config)
-    except _RUN_ERRORS as exc:
-        typer.secho(str(exc), fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
+    results = run_suite(
+        tasks,
+        configs,
+        max_attempts=max_attempts,
+        sandbox_config=sandbox_config,
+        max_error_retries=max_error_retries,
+    )
 
     if "cli" in report:
         economics.render(results)
