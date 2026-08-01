@@ -185,6 +185,23 @@ verdict bench --suite examples/starter_suite --agent mock --agent claude-code
 
 A suite task is just a `verdict run` with its repo and task text pre-wired — see `examples/starter_suite/*/task.yml` for the format, and DESIGN.md's Phase 5 section for why acceptance criteria are never written as prose.
 
+## Statistical rigor
+
+Two diagnostics, neither of them a merge gate — see DESIGN.md's Phase 7 section for the full reasoning.
+
+```bash
+# How often does the vision judge actually agree with a human reviewer?
+verdict calibrate --dataset examples/calibration_dataset/manifest.json --judge mock
+
+# Run the same task N independent times; report pass rate with a Wilson confidence interval.
+verdict flaky --task "fix the bug" --agent mock --repo examples/sample_repo --trials 10 --json baseline.json
+
+# Later: is a pass-rate change a real regression, or noise from a small sample?
+verdict flaky --task "fix the bug" --agent mock --repo examples/sample_repo --trials 10 --compare-to baseline.json
+```
+
+`calibrate` warns (never fails the process) when a judge's concordance with human labels drops below `--threshold` (default 95%). `flaky --compare-to` runs a real two-proportion z-test, not a raw percentage diff, so a ten-point pass-rate swing across a handful of trials gets called `NOISE` rather than a false-alarm `REGRESSION`.
+
 ## Roadmap
 
 - [x] Executable grounding: test / typecheck / build / lint in isolated worktrees
@@ -194,8 +211,8 @@ A suite task is just a `verdict run` with its repo and task text pre-wired — s
 - [x] Frontend truth: DOM + interaction + perceptual diff + vision-intent judge
 - [x] CI merge gate (GitHub Action)
 - [x] Adapters: Claude Code, Cursor, Codex, Aider, OpenHands
-- [ ] Judge calibration report (concordance vs. human labels, target ≥ 95%)
-- [ ] Flakiness detection (multi-seed variance, confidence intervals on pass-rate)
+- [x] Judge calibration report (concordance vs. human labels, target ≥ 95%)
+- [x] Flakiness detection (multi-seed variance, confidence intervals on pass-rate)
 - [ ] Hosted dashboard + historical regression tracking
 
 ## How Verdict relates to prior work

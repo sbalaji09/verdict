@@ -1721,3 +1721,200 @@ authenticated against a real repo, in this environment). Two levels:
   — it's rendered once, fully, at report-generation time. A dashboard that
   updates live or pulls from an API is a different kind of artifact than
   "a single file `actions/upload-artifact` can attach to a run."
+
+---
+
+## Phase 7 — Statistical Rigor
+
+## The goal, restated
+
+Every phase through Phase 6 answers a single yes/no question well: did
+this one attempt pass, does this one PR merge. Two questions neither
+answers, both flagged explicitly as future work back in Phase 4's own
+scope-cut notes: **is the JUDGED bucket's opinion actually any good**, and
+**is a pass-rate change real, or is it noise from re-running something that
+was never perfectly deterministic in the first place.** Phase 7 answers
+both with real, if modest, statistics — `calibration.py` and
+`flakiness.py` — kept deliberately outside `Verdict`'s own schema: neither
+is a property of one attempt, so neither belongs on `Verdict` itself.
+
+## Judge calibration: concordance, not vibes
+
+`Verdict.status` already refuses to let a JUDGED signal decide DONE/
+NOT_DONE — that's been true since Phase 0. But "can't be load-bearing" and
+"is worth reading at all" are different claims, and nothing before this
+phase measured the second one. A vision judge that agrees with a human
+reviewer 55% of the time is barely better than a coin flip; its PR-comment
+opinion would still render with exactly the same confident tone as one
+that's right 95% of the time; a team would have no way to know which one
+they'd wired up.
+
+`calibration.py`'s `run_calibration(judge, examples, threshold=0.95)` is
+almost embarrassingly simple by design: for each `LabeledExample`
+(a screenshot, the intent it was checked against, and a human's own
+true/false verdict), run the judge, compare `judgment.passed` to
+`human_label`, and count agreements. `CalibrationResult.concordance` is
+`agreements / total` — a `@computed_field`, not a stored value, following
+the exact "unknown reported as unknown" rule `Verdict.status` already
+established: `concordance` is `None` (not `0.0`, not `1.0`) when the
+dataset has zero examples, and `meets_threshold` is correspondingly
+`False` rather than treating "nothing measured" as a pass.
+
+**The dataset format is a JSON manifest, not a new gate or a new
+Provenance value.** `load_labeled_dataset` reads
+`[{"name", "screenshot", "intent", "human_label"}, ...]`, with
+`screenshot` resolved relative to the manifest's own directory — same
+"co-located, portable" convention `examples/starter_suite/*/task.yml`'s
+`repo` field already uses. This is deliberately a standalone tool a team
+runs once (or on a schedule) to audit a judge they've configured, not
+something wired into `verdict run`/`gate`'s own hot path — calibration
+against a fixed labeled set doesn't change per-PR, so re-running it on
+every gate invocation would just be wasted judge calls.
+
+**Every individual disagreement is kept, not just the aggregate number.**
+`CalibrationResult.disagreements: list[Disagreement]` names exactly which
+example the judge got wrong and what it said — a 75% concordance score
+alone tells a team "something's off"; the disagreement list tells them
+*which screenshots* to go look at, the same "point at the evidence, don't
+just report a verdict" instinct behind Phase 2's `Attribution.explanation`
+and Phase 4's glitch-scan video retention.
+
+**`verdict calibrate` never exits non-zero.** Consistent with `bench`'s
+own policy (Phase 5): a below-threshold concordance is diagnostic
+information a team acts on deliberately, not a build to fail — there's no
+CI step where "the judge's calibration regressed" should silently block a
+merge the way a failing PROVEN gate does. The CLI prints a loud
+`[bold red]WARNING[/bold red]` instead, and that's the whole enforcement
+mechanism this phase ships.
+
+**Only `MockVisionJudge` ships to calibrate against, for the same reason
+Phase 4 never shipped a real vision-model integration.** `examples/
+calibration_dataset/` demonstrates the mechanism honestly rather than
+pretending to demonstrate a real judge's accuracy: `MockVisionJudge`
+always returns `passed=True` (see `frontend/vision_judge.py`), so the
+dataset's four hand-labeled examples (three `human_label: true`, one
+`human_label: false`) drive its concordance to exactly `75%` — below the
+`95%` default target, triggering the warning path on every demo run. This
+is real arithmetic over a real (if intentionally simple) judge, not a
+canned "success" output; a team that plugs in a real `VisionJudge`
+implementation runs the identical command against their own labeled
+screenshots.
+
+## Flakiness detection: a real interval, not a raw percentage
+
+The second gap: nothing before this phase distinguished "this agent got
+worse" from "I ran it twice and got a different answer, because agents
+(and browsers, and dev servers) aren't perfectly deterministic." A raw
+pass-rate comparison — "70% last week, 60% this week" — looks like a
+regression right up until you ask how much of that ten-point gap a handful
+of trials could produce by chance alone, which for small samples is often
+"most of it or all of it."
+
+`flakiness.py::run_flakiness(task, repo, adapter, trials=10)` runs the
+exact same `(task, repo, adapter)` through `runner.run()` — not
+`run_with_retries()` — independently, `trials` times, and reports the raw
+pass count plus a **Wilson score interval** around the pass rate. Two
+choices worth calling out:
+
+- **`run()`, deliberately not `run_with_retries()`.** Retries exist to
+  *get past* a flaky failure on one task attempt (Phase 3); flakiness
+  detection exists to *measure how often that failure happens in the
+  first place*. Feeding retried outcomes into this measurement would hide
+  exactly the variance it's trying to surface — a task that "always
+  eventually passes by attempt 3" would report artificially high, when
+  the number that actually matters here is "how often does attempt 1
+  work."
+- **Wilson, not the naive normal-approximation interval.** The textbook
+  `p ± z·√(p(1-p)/n)` interval degenerates exactly where flakiness
+  detection lives: small `n` (a handful of trials, not thousands) and `p`
+  near 0 or 1 (a mostly-reliable agent, the common case). At `p=1.0` after
+  3/3 passing trials, the naive interval collapses to `[1.0, 1.0]` — a
+  claim of *zero-width certainty* from three data points, which is simply
+  false. Wilson's interval still narrows toward 1.0 as `n` grows, but
+  never claims that kind of certainty from a small sample — verified
+  directly in `test_wilson_interval_never_claims_zero_width_certainty_at_p_one`.
+  Computing an arbitrary confidence level's critical `z` would need the
+  normal quantile function, which isn't in the standard library and isn't
+  worth hand-approximating (a real source of subtle, hard-to-notice
+  error); `_Z_FOR_CONFIDENCE` hardcodes the three standard levels
+  (90/95/99%) and `wilson_interval` raises for anything else rather than
+  quietly using a slightly-wrong number.
+
+## Regression vs. noise: a real two-proportion z-test
+
+`compare_flakiness(baseline, candidate)` is the direct answer to "is this
+change real": a pooled two-proportion z-test over the two
+`FlakinessResult`s, producing an actual `p_value`, not a hand-wavy "the
+number went down." `ComparisonVerdict` is three-way — `REGRESSION`,
+`IMPROVEMENT`, `NOISE` — and `NOISE` is the answer whenever `p_value`
+doesn't clear `alpha` (default `0.05`), the exact same "an honest 'can't
+tell' beats a guess in either direction" discipline Phase 2's bisector uses
+for `skip` and Phase 6's `INCONCLUSIVE` attribution kind: a ten-point raw
+pass-rate drop across two 10-trial samples is `NOISE` here (verified in
+`test_small_sample_gap_is_noise_not_a_regression`), because ten trials
+genuinely can't distinguish that gap from chance — reporting it as a
+confirmed regression would be a false alarm dressed up as rigor.
+
+The pooled standard error degenerates to exactly `0` when both samples'
+outcomes agree completely (`p_pool` collapses to `0` or `1` — every trial
+in both samples was the same outcome) — handled as its own case rather
+than as a division-by-zero crash, always resolving to `NOISE`, which is
+the only mathematically consistent answer when both proportions are
+already identical.
+
+## Why neither tool touches `Verdict`'s schema
+
+Both `CalibrationResult` and `FlakinessResult`/`FlakinessComparison` are
+Pydantic models (for the same free JSON serialization every schema type in
+this codebase gets — `verdict flaky --json` round-trips a `FlakinessResult`
+straight through `model_dump_json`/`model_validate_json` for a later
+`--compare-to`), but neither is added to `schema.py`. Both are reports
+*about* a judge or an agent's variance, generated by running many
+`Verdict`s/`run()` calls, never a property any single `Verdict` carries —
+the same "the whole codebase is organized around what's PROVEN vs.
+JUDGED" boundary just doesn't have anywhere for "how often was this
+proof itself proof" to plug into a single verdict's own fields. This
+mirrors `failure_modes.py`'s `FailureModeBreakdown` (Phase 5): a tally
+computed *over* a `ConfigResult`, kept as its own module-local type rather
+than bolted onto `ConfigResult` itself.
+
+## Tests
+
+`test_flakiness.py` and `test_calibration.py` split the same way the
+modules do: pure-math claims (Wilson interval shape, the z-test's
+regression/improvement/noise classification, including the two
+degenerate zero-standard-error cases) are asserted directly against known
+inputs; `run_flakiness` gets one real end-to-end test against the shared
+`git_repo` fixture with a deliberately-alternating fake adapter (fixes the
+bug on odd calls, leaves it broken on even ones) proving trials are
+genuinely independent `run()` calls, not a cached or reused result;
+`load_labeled_dataset` is tested against every malformed-manifest shape
+(missing key, non-boolean label, missing screenshot file, empty dataset)
+the same defensive-parsing standard `suite/loader.py` already holds
+itself to.
+
+## What's explicitly out of scope for Phase 7
+
+- **No real vision-model judge to calibrate against** — same scope line
+  Phase 4 drew for `VisionJudge` itself; `MockVisionJudge` is what
+  `examples/calibration_dataset` demonstrates the mechanism against, real
+  and honestly imperfect (75% concordance), not a stand-in pretending to
+  be a real model's score.
+- **No automatic CI gate on calibration or flakiness** — `calibrate` warns,
+  `flaky` reports; neither exits non-zero. `verdict gate` (Phase 6)
+  remains the only command whose exit code blocks a merge, on purpose —
+  see that phase's "no configurable gate policy" note for why blocking on
+  a *statistical* signal specifically would be a different, weaker kind of
+  promise than blocking on an executed PROVEN check.
+- **No persisted history of calibration/flakiness runs across
+  invocations** — `--compare-to` reads one prior `--json` file the caller
+  supplies; there's no database or trend store keeping every past run.
+  Same scope line Phase 5/6 already drew for `bench`/`gate` history.
+- **`run_flakiness` has no seed/temperature control over the agent
+  itself** — "multi-seed" here means "N independent real attempts," not
+  controlling an adapter's own sampling parameters, which `Adapter`'s
+  interface (Phase 0) has no hook for and isn't uniform across the five
+  adapters Phase 5 added.
+- **Only three confidence levels are supported** (90/95/99%) — see the
+  Wilson interval section above for why an arbitrary level isn't worth the
+  normal-quantile approximation it would require.
