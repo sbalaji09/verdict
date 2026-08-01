@@ -1,0 +1,26 @@
+[
+  {
+    "name": "cta-above-the-fold",
+    "screenshot": "screenshot.png",
+    "intent": "A prominent CTA button is visible above the fold.",
+    "human_label": true
+  },
+  {
+    "name": "nav-shows-logo",
+    "screenshot": "screenshot.png",
+    "intent": "The nav bar shows the site logo.",
+    "human_label": true
+  },
+  {
+    "name": "footer-has-contact-link",
+    "screenshot": "screenshot.png",
+    "intent": "The footer includes a contact link.",
+    "human_label": true
+  },
+  {
+    "name": "modal-should-be-closed",
+    "screenshot": "screenshot.png",
+    "intent": "A signup modal is closed by default.",
+    "human_label": false
+  }
+]

@@ -13,7 +13,23 @@ from verdict.adapters.codex import CodexAdapter, CodexAdapterError
 from verdict.adapters.cursor import CursorAdapter, CursorAdapterError
 from verdict.adapters.mock import MockAdapter, SuiteMockAdapter
 from verdict.adapters.openhands import OpenHandsAdapter, OpenHandsAdapterError
+from verdict.calibration import (
+    DEFAULT_CONCORDANCE_THRESHOLD,
+    DatasetLoadError,
+    load_labeled_dataset,
+    render_calibration,
+    run_calibration,
+)
 from verdict.failure_modes import render_failure_modes
+from verdict.flakiness import (
+    DEFAULT_TRIALS,
+    FlakinessResult,
+    compare_flakiness,
+    render_comparison,
+    render_flakiness,
+    run_flakiness,
+)
+from verdict.frontend.vision_judge import MockVisionJudge, VisionJudge
 from verdict.pr_comment import build_comment_from_file
 from verdict.report import render_task_run
 from verdict.report_html import render_html
@@ -320,6 +336,103 @@ def gate_cmd(
 
     if not verdict.done:
         sys.exit(1)
+
+
+# Only a mock ships today — same honest scope line Phase 4 drew for
+# VisionJudge itself: a real vision-model integration is its own project
+# (pick a vendor, handle auth, validate against real screenshots), not
+# something to fake here.
+_JUDGES: dict[str, type[VisionJudge]] = {
+    "mock": MockVisionJudge,
+}
+
+
+def _build_judge(name: str) -> VisionJudge:
+    factory = _JUDGES.get(name)
+    if factory is None:
+        raise typer.BadParameter(f"unknown judge: {name!r} (choices: {', '.join(_JUDGES)})")
+    return factory()
+
+
+@app.command(name="calibrate")
+def calibrate_cmd(
+    dataset: Path = typer.Option(
+        ...,
+        "--dataset",
+        help="Path to a calibration manifest.json (see examples/calibration_dataset).",
+    ),
+    judge: str = typer.Option("mock", "--judge", help=f"Which VisionJudge to score: {', '.join(_JUDGES)}"),
+    threshold: float = typer.Option(
+        DEFAULT_CONCORDANCE_THRESHOLD, "--threshold", help="Target concordance (fraction, e.g. 0.95)."
+    ),
+) -> None:
+    """Score `--judge` against a human-labeled dataset and report its
+    concordance — how often the judge's PASS/FAIL agrees with the human
+    label. Never fails the process: this is a diagnostic, not a merge gate,
+    so a below-threshold result prints a warning rather than a nonzero exit.
+    """
+    try:
+        examples = load_labeled_dataset(dataset)
+    except DatasetLoadError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    result = run_calibration(_build_judge(judge), examples, threshold=threshold)
+    render_calibration(result)
+
+
+@app.command(name="flaky")
+def flaky_cmd(
+    task: str = typer.Option(..., "--task", help="Natural-language description of the work."),
+    agent: str = typer.Option(
+        ..., "--agent", help=f"Which adapter to drive: mock | {' | '.join(_REAL_AGENTS)}"
+    ),
+    repo: Path = typer.Option(..., "--repo", help="Path to a git repository to grade against."),
+    trials: int = typer.Option(
+        DEFAULT_TRIALS, "--trials", help="Independent runs to average over — each its own fresh worktree."
+    ),
+    compare_to: Path | None = typer.Option(
+        None,
+        "--compare-to",
+        help="A previous `--json` output to compare against via a two-proportion z-test.",
+    ),
+    json_out: Path | None = typer.Option(
+        None, "--json", help="Write this run's FlakinessResult to this path (for a later --compare-to)."
+    ),
+) -> None:
+    """Run `--agent` on `--task` against `--repo` `--trials` independent
+    times and report the pass rate with a Wilson confidence interval. With
+    `--compare-to`, also runs a two-proportion z-test against a prior run's
+    saved result to say whether a pass-rate change is a real regression or
+    just noise from a small sample — see DESIGN.md's Phase 7 section.
+
+    Every real --agent trial is real spend, multiplied by --trials; this
+    is a research/CI-diagnostics command, not something to run against a
+    paid agent without budgeting for it.
+    """
+    adapter = _build_adapter(agent, repo)
+    try:
+        result = run_flakiness(task=task, repo=repo, adapter=adapter, trials=trials)
+    except _RUN_ERRORS as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    if compare_to is not None:
+        if not compare_to.exists():
+            typer.secho(f"no baseline found at {compare_to}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2)
+        baseline = FlakinessResult.model_validate_json(compare_to.read_text())
+        comparison = compare_flakiness(
+            baseline, result, baseline_label=str(compare_to), candidate_label=agent
+        )
+        render_comparison(comparison)
+    else:
+        render_flakiness(result, label=agent)
+
+    if json_out is not None:
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        json_out.write_text(result.model_dump_json(indent=2))
+        typer.echo(f"wrote {json_out}")
 
 
 @app.command(name="pr-comment")
