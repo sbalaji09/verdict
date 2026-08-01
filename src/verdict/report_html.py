@@ -57,11 +57,14 @@ def _fmt_rate(rate: float | None) -> str:
 def _render_leaderboard_rows(config_results: list[ConfigResult]) -> str:
     rows = []
     for i, cr in enumerate(rank(config_results), start=1):
+        graded = cr.tasks_total - cr.tasks_errored
+        errored_cell = f"{cr.tasks_errored}/{cr.tasks_total}" if cr.tasks_errored else "—"
         rows.append(
             "<tr>"
             f"<td>{i}</td>"
             f"<td>{escape(cr.label)}</td>"
-            f"<td>{cr.tasks_done}/{cr.tasks_total} ({cr.pass_rate:.0%})</td>"
+            f"<td>{cr.tasks_done}/{graded} ({cr.pass_rate:.0%})</td>"
+            f'<td class="errored-cell">{errored_cell}</td>'
             f"<td>{_fmt_cost(cr.total_cost_usd)}</td>"
             f"<td>{_fmt_rate(cr.pass_rate_per_dollar)}</td>"
             "</tr>"
@@ -211,6 +214,7 @@ summary::-webkit-details-marker { display: none; }
   max-height: 220px; overflow-y: auto;
 }
 .attributions { margin-top: 0.5rem; }
+.errored-cell { color: #a3a; font-weight: 600; }
 #filter-bar { margin: 1rem 0; }
 .hidden-by-filter { display: none !important; }
 """
@@ -221,8 +225,11 @@ document.addEventListener('DOMContentLoaded', function () {
   if (!checkbox) return;
   checkbox.addEventListener('change', function () {
     document.querySelectorAll('details.task').forEach(function (el) {
-      var isFail = el.classList.contains('fail');
-      el.classList.toggle('hidden-by-filter', checkbox.checked && !isFail);
+      // "failures" here means anything not a clean DONE — a fail and an
+      // error are both worth a human's attention, just for different
+      // reasons, so the filter keeps both and only hides a pass.
+      var isDone = el.classList.contains('pass');
+      el.classList.toggle('hidden-by-filter', checkbox.checked && isDone);
     });
   });
 });
@@ -249,7 +256,7 @@ signals are a model's opinion — advisory only, shown with a dashed border, nev
 <h2>Leaderboard</h2>
 <table>
 <thead><tr>
-<th>rank</th><th>config</th><th>pass rate</th><th>total cost</th><th>verdict-pts/$</th>
+<th>rank</th><th>config</th><th>pass rate</th><th>errored</th><th>total cost</th><th>verdict-pts/$</th>
 </tr></thead>
 <tbody>
 {_render_leaderboard_rows(config_results)}

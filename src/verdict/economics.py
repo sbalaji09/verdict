@@ -41,16 +41,24 @@ def render(entries: list[ConfigResult], console: Console | None = None) -> None:
     table.add_column("rank", justify="right")
     table.add_column("config")
     table.add_column("pass rate", justify="right")
+    table.add_column("errored", justify="right")
     table.add_column("total cost", justify="right")
     table.add_column("verdict-pts/$", justify="right")
 
     for i, entry in enumerate(rank(entries), start=1):
         cost = entry.total_cost_usd
         rate = entry.pass_rate_per_dollar
+        graded = entry.tasks_total - entry.tasks_errored
+        # "pass rate" is always done/GRADED, matching `pass_rate`'s own
+        # denominator — an ERROR task is infra noise, not a task this
+        # config was actually judged against, so it never appears as a
+        # silent extra denominator here either. A dedicated "errored"
+        # column is what surfaces it, distinctly from a real failure.
         table.add_row(
             str(i),
             entry.label,
-            f"{entry.tasks_done}/{entry.tasks_total} ({entry.pass_rate:.0%})",
+            f"{entry.tasks_done}/{graded} ({entry.pass_rate:.0%})",
+            f"{entry.tasks_errored}/{entry.tasks_total}" if entry.tasks_errored else "—",
             f"${cost:.2f}" if cost is not None else "unknown",
             f"{rate:.2f}" if rate is not None else "—",
         )
