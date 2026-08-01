@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from verdict.adapters import AdapterError
 from verdict.sandbox import Sandbox
 from verdict.sandbox.config import fallback_sandbox
 from verdict.schema import AttemptResult
@@ -20,7 +21,7 @@ from verdict.schema import AttemptResult
 DEFAULT_TIMEOUT_SECONDS = 900
 
 
-class ClaudeCodeAdapterError(RuntimeError):
+class ClaudeCodeAdapterError(AdapterError):
     """Raised when the `claude` CLI itself fails to run (not when the agent
     merely fails the task — that's reflected in AttemptResult/gates)."""
 

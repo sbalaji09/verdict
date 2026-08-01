@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from verdict.adapters import AdapterError
 from verdict.sandbox import Sandbox
 from verdict.sandbox.config import fallback_sandbox
 from verdict.schema import AttemptResult
@@ -28,7 +29,7 @@ _TOKENS_RE = re.compile(r"Tokens:\s*([\d.]+k?)\s*sent,\s*([\d.]+k?)\s*received",
 _COST_RE = re.compile(r"Cost:\s*\$([\d.]+)\s*message,\s*\$([\d.]+)\s*session", re.IGNORECASE)
 
 
-class AiderAdapterError(RuntimeError):
+class AiderAdapterError(AdapterError):
     """Raised when the `aider` CLI itself fails to run (not when the agent
     merely fails the task — that's reflected in AttemptResult/gates)."""
 

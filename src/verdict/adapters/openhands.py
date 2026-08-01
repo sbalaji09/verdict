@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from verdict.adapters import AdapterError
 from verdict.sandbox import Sandbox
 from verdict.sandbox.config import fallback_sandbox
 from verdict.schema import AttemptResult
@@ -36,7 +37,7 @@ three CLIs in practice, hence a longer default than
 `ClaudeCodeAdapter`/`CursorAdapter`/`CodexAdapter`/`AiderAdapter`."""
 
 
-class OpenHandsAdapterError(RuntimeError):
+class OpenHandsAdapterError(AdapterError):
     """Raised when the `openhands` CLI itself fails to run (not when the
     agent merely fails the task — that's reflected in AttemptResult/gates)."""
 
