@@ -14,8 +14,12 @@ from verdict.adapters.cursor import CursorAdapter, CursorAdapterError
 from verdict.adapters.mock import MockAdapter, SuiteMockAdapter
 from verdict.adapters.openhands import OpenHandsAdapter, OpenHandsAdapterError
 from verdict.failure_modes import render_failure_modes
+from verdict.pr_comment import build_comment_from_file
 from verdict.report import render_task_run
-from verdict.runner import run_with_retries
+from verdict.report_html import render_html
+from verdict.report_json import render_json
+from verdict.runner import grade_existing_diff, run_with_retries
+from verdict.schema import ConfigResult, TaskRun
 from verdict.suite import BenchConfig, SuiteLoadError, load_suite, run_suite
 from verdict.worktree import WorktreeError
 
@@ -157,6 +161,39 @@ def _build_bench_adapter(agent: str) -> Adapter:
     return factory()
 
 
+_REPORT_FORMATS = ("cli", "json", "html")
+_REPORT_HELP = f"Repeatable: which reporter(s) to produce. Choices: {' | '.join(_REPORT_FORMATS)}."
+
+
+def _write_machine_reports(formats: list[str], output_dir: Path, config_results: list[ConfigResult]) -> None:
+    """Writes the `json`/`html` reporters if requested — `cli` is handled
+    separately by each command's own rich-based renderer, since that one
+    prints to the terminal rather than a file. Shared across `run`/`bench`/
+    `gate` so all three reporters (and the merge-gate/scorecard commands
+    that produce them) stay in exact lockstep: one `ConfigResult` shape,
+    one place that serializes it.
+    """
+    unknown = set(formats) - set(_REPORT_FORMATS)
+    if unknown:
+        raise typer.BadParameter(
+            f"unknown --report format(s): {', '.join(sorted(unknown))} "
+            f"(choices: {', '.join(_REPORT_FORMATS)})"
+        )
+
+    if "json" not in formats and "html" not in formats:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if "json" in formats:
+        path = output_dir / "verdict-report.json"
+        path.write_text(render_json(config_results))
+        typer.echo(f"wrote {path}")
+    if "html" in formats:
+        path = output_dir / "verdict-report.html"
+        path.write_text(render_html(config_results))
+        typer.echo(f"wrote {path}")
+
+
 @app.command(name="run")
 def run_cmd(
     task: str = typer.Option(..., "--task", help="Natural-language description of the work."),
@@ -173,6 +210,10 @@ def run_cmd(
             "Each retry re-runs the real agent — with a real --agent that's real spend."
         ),
     ),
+    report: list[str] = typer.Option(["cli"], "--report", help=_REPORT_HELP),
+    output_dir: Path = typer.Option(
+        Path("verdict-report"), "--output-dir", help="Where json/html reports are written."
+    ),
 ) -> None:
     """Run an agent against one task (retrying on failure if --max-attempts > 1)
     and print its Verdict plus the cost across every attempt made.
@@ -188,7 +229,10 @@ def run_cmd(
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
 
-    render_task_run(task_run)
+    if "cli" in report:
+        render_task_run(task_run)
+    _write_machine_reports(report, output_dir, [ConfigResult(label=agent, task_runs=[task_run])])
+
     if not task_run.done:
         sys.exit(1)
 
@@ -209,12 +253,16 @@ def bench_cmd(
     max_attempts: int = typer.Option(
         1, "--max-attempts", help="Retry each task up to this many times per config, stopping early on DONE."
     ),
+    report: list[str] = typer.Option(["cli"], "--report", help=_REPORT_HELP),
+    output_dir: Path = typer.Option(
+        Path("verdict-report"), "--output-dir", help="Where json/html reports are written."
+    ),
 ) -> None:
     """Run every --agent against every task in --suite, then print a
     pass-rate-per-dollar leaderboard and a failure-mode breakdown.
 
     Unlike `verdict run`, this never exits non-zero for a bad score — it's
-    a scorecard, not a merge gate; use `verdict run` in CI for that.
+    a scorecard, not a merge gate; use `verdict gate` in CI for that.
     """
     try:
         tasks = load_suite(suite)
@@ -230,8 +278,65 @@ def bench_cmd(
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
 
-    economics.render(results)
-    render_failure_modes(results)
+    if "cli" in report:
+        economics.render(results)
+        render_failure_modes(results)
+    _write_machine_reports(report, output_dir, results)
+
+
+@app.command(name="gate")
+def gate_cmd(
+    repo: Path = typer.Option(
+        Path("."), "--repo", help="Path to the repo to grade — graded in place, not isolated."
+    ),
+    base: str = typer.Option(
+        ..., "--base", help="Git ref to diff/attribute against (a PR's base branch or merge-base SHA)."
+    ),
+    label: str = typer.Option("gate", "--label", help="Label for this run in json/html reports."),
+    report: list[str] = typer.Option(["cli"], "--report", help=_REPORT_HELP),
+    output_dir: Path = typer.Option(
+        Path("verdict-report"), "--output-dir", help="Where json/html reports are written."
+    ),
+) -> None:
+    """Grade `--repo` exactly as it's already checked out against `--base`
+    — no adapter, no isolation. This is the merge-gate command: a pull
+    request's diff already exists as real commits, so there's nothing to
+    drive an agent against, just gates/frontend-checks/attribution run
+    against what's already there. See DESIGN.md's Phase 6 section for the
+    gate policy this enforces: any failing PROVEN signal fails the check;
+    JUDGED signals never do.
+    """
+    try:
+        verdict = grade_existing_diff(repo=repo, base_ref=base)
+    except WorktreeError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    task_run = TaskRun(task=verdict.task, agent=label, repo=verdict.repo, attempts=[verdict])
+
+    if "cli" in report:
+        render_task_run(task_run)
+    _write_machine_reports(report, output_dir, [ConfigResult(label=label, task_runs=[task_run])])
+
+    if not verdict.done:
+        sys.exit(1)
+
+
+@app.command(name="pr-comment")
+def pr_comment_cmd(
+    report_path: Path = typer.Argument(
+        ..., help="Path to a verdict-report.json (from `--report json`) to build the comment from."
+    ),
+) -> None:
+    """Print the advisory PR-comment body (JUDGED signals only) for a
+    verdict-report.json to stdout. Used by the GitHub Action to build the
+    comment it posts with `gh pr comment` — this command never touches
+    GitHub itself, it only builds the text.
+    """
+    if not report_path.exists():
+        typer.secho(f"no report found at {report_path}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    typer.echo(build_comment_from_file(report_path))
 
 
 if __name__ == "__main__":

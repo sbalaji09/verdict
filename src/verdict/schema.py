@@ -16,7 +16,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class Provenance(str, Enum):
@@ -181,6 +181,7 @@ class Verdict(BaseModel):
             if s.provenance is Provenance.PROVEN and s.status is not GateStatus.NA
         ]
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def status(self) -> VerdictStatus:
         """DONE only if every *applicable* PROVEN gate passed. JUDGED
@@ -198,6 +199,7 @@ class Verdict(BaseModel):
             return VerdictStatus.NOT_DONE
         return VerdictStatus.DONE
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def done(self) -> bool:
         """Convenience boolean for callers that just need pass/fail (e.g.
@@ -206,6 +208,7 @@ class Verdict(BaseModel):
         """
         return self.status is VerdictStatus.DONE
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def confidence(self) -> Confidence:
         """LOW whenever the test gate didn't actually run (missing, or
@@ -245,26 +248,32 @@ class TaskRun(BaseModel):
         stops early on DONE, so in practice this is just `attempts[-1]`)."""
         return self.attempts[-1]
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def done(self) -> bool:
         return self.final.done
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def attempt_count(self) -> int:
         return len(self.attempts)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def failed_attempt_count(self) -> int:
         return sum(1 for v in self.attempts if not v.done)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def total_tokens_input(self) -> int:
         return sum(v.attempt.tokens_input for v in self.attempts)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def total_tokens_output(self) -> int:
         return sum(v.attempt.tokens_output for v in self.attempts)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def total_cost_usd(self) -> float | None:
         """None if *any* attempt's cost is unknown — summing the attempts
@@ -290,20 +299,24 @@ class ConfigResult(BaseModel):
     label: str
     task_runs: list[TaskRun]
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def tasks_total(self) -> int:
         return len(self.task_runs)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def tasks_done(self) -> int:
         return sum(1 for t in self.task_runs if t.done)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def pass_rate(self) -> float:
         if not self.task_runs:
             return 0.0
         return self.tasks_done / self.tasks_total
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def total_cost_usd(self) -> float | None:
         total = 0.0
@@ -314,14 +327,17 @@ class ConfigResult(BaseModel):
             total += cost
         return total
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def total_tokens_input(self) -> int:
         return sum(t.total_tokens_input for t in self.task_runs)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def total_tokens_output(self) -> int:
         return sum(t.total_tokens_output for t in self.task_runs)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def pass_rate_per_dollar(self) -> float | None:
         """"verdict-pts/$" — one verdict point per task confirmed DONE.

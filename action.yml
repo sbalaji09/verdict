@@ -1,0 +1,115 @@
+name: "Verdict"
+description: >-
+  Grades a pull request on executable truth. Fails the check on any
+  failing PROVEN signal (test/typecheck/build/lint/frontend); posts
+  JUDGED signals as an advisory, non-blocking PR comment.
+author: "verdict-ai"
+branding:
+  icon: "check-circle"
+  color: "green"
+
+inputs:
+  repo:
+    description: "Path to the repo to grade (defaults to the action's own workspace checkout)."
+    required: false
+    default: "."
+  base-ref:
+    description: >-
+      Git ref to diff/attribute against — the PR's base branch or merge-base SHA.
+      Defaults to the pull request's base SHA; only meaningful when the
+      workflow event is `pull_request`.
+    required: false
+    default: ${{ github.event.pull_request.base.sha }}
+  python-version:
+    description: "Python version used to install and run Verdict."
+    required: false
+    default: "3.11"
+  install-frontend-extra:
+    description: >-
+      Install the `frontend` extra plus a Chromium browser. Only needed if
+      the graded repo's verdict.yml configures a `frontend:` section —
+      skipped by default since it costs real setup time otherwise.
+    required: false
+    default: "false"
+  github-token:
+    description: "Token used to post the advisory PR comment via the `gh` CLI."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  status:
+    description: "done | not_done | unverified — Verdict.status from the graded run."
+    value: ${{ steps.gate.outputs.status }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install Verdict
+      shell: bash
+      run: |
+        if [ "${{ inputs.install-frontend-extra }}" = "true" ]; then
+          pip install "verdict-eval[frontend]"
+          playwright install --with-deps chromium
+        else
+          pip install verdict-eval
+        fi
+
+    - name: Run the gate
+      id: gate
+      shell: bash
+      # `continue-on-error` keeps this step from failing the job immediately —
+      # the artifact upload and PR-comment steps below must still run even
+      # when the gate fails. `set +e`/`set -e` bracket only the one command
+      # whose exit code we need to capture; everything else keeps failing
+      # loudly as normal.
+      continue-on-error: true
+      run: |
+        set +e
+        verdict gate --repo "${{ inputs.repo }}" --base "${{ inputs.base-ref }}" \
+          --report cli --report json --report html --output-dir verdict-report
+        code=$?
+        set -e
+        echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+        status=$(python -c "
+        import json
+        report = json.load(open('verdict-report/verdict-report.json'))
+        print(report['configs'][0]['task_runs'][0]['attempts'][-1]['status'])
+        " 2>/dev/null || echo "unverified")
+        echo "status=${status}" >> "$GITHUB_OUTPUT"
+
+    - name: Upload verdict-report artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: verdict-report
+        path: verdict-report
+        if-no-files-found: ignore
+
+    - name: Build advisory PR comment (judged signals only)
+      if: always() && github.event_name == 'pull_request'
+      shell: bash
+      run: verdict pr-comment verdict-report/verdict-report.json > /tmp/verdict-pr-comment.md
+
+    - name: Post advisory PR comment
+      if: always() && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      # Advisory only: this comment reports JUDGED signals and never
+      # affects the check below — see DESIGN.md's Phase 6 section for why
+      # the two are structurally separate. `--edit-last` upserts so a
+      # repeatedly-pushed PR gets one updated comment, not a growing pile.
+      run: |
+        gh pr comment "${{ github.event.pull_request.number }}" \
+          --edit-last --body-file /tmp/verdict-pr-comment.md \
+          || gh pr comment "${{ github.event.pull_request.number }}" \
+          --body-file /tmp/verdict-pr-comment.md
+
+    - name: Fail the check if the gate failed
+      shell: bash
+      run: exit ${{ steps.gate.outputs.exit_code }}
