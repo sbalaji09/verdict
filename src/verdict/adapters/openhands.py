@@ -24,9 +24,10 @@ reporting "unknown," per this whole schema's own discipline about
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
+from verdict.sandbox import Sandbox
+from verdict.sandbox.config import fallback_sandbox
 from verdict.schema import AttemptResult
 
 DEFAULT_TIMEOUT_SECONDS = 1800
@@ -49,7 +50,7 @@ class OpenHandsAdapter:
     def __init__(self, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> None:
         self._timeout_seconds = timeout_seconds
 
-    def run(self, task: str, worktree: Path) -> AttemptResult:
+    def run(self, task: str, worktree: Path, sandbox: Sandbox | None = None) -> AttemptResult:
         command = [
             "openhands",
             "run",
@@ -57,26 +58,19 @@ class OpenHandsAdapter:
             task,
             "--no-auto-continue",  # stop after the task is addressed, don't keep prompting itself
         ]
-        try:
-            result = subprocess.run(
-                command,
-                cwd=worktree,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout_seconds,
-            )
-        except FileNotFoundError as exc:
+        result = (sandbox or fallback_sandbox()).exec(
+            command, cwd=worktree, timeout_seconds=self._timeout_seconds
+        )
+        if result.exit_code == 127:
             raise OpenHandsAdapterError(
                 "`openhands` CLI not found on PATH. Install OpenHands, or use "
                 "--agent mock to exercise the pipeline without it."
-            ) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise OpenHandsAdapterError(
-                f"openhands did not finish within {self._timeout_seconds}s"
-            ) from exc
+            )
+        if result.timed_out:
+            raise OpenHandsAdapterError(f"openhands did not finish within {self._timeout_seconds}s")
 
-        if result.returncode != 0:
-            raise OpenHandsAdapterError(f"openhands exited {result.returncode}:\n{result.stderr.strip()}")
+        if result.exit_code != 0:
+            raise OpenHandsAdapterError(f"openhands exited {result.exit_code}:\n{result.stderr.strip()}")
 
         # diff/files_changed are filled in by runner.py, which knows the
         # worktree's base commit. No structured usage/cost — see module

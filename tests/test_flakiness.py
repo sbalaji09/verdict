@@ -110,7 +110,7 @@ class _AlternatingAdapter:
     def __init__(self) -> None:
         self.calls = 0
 
-    def run(self, task: str, worktree: Path) -> AttemptResult:
+    def run(self, task: str, worktree: Path, sandbox=None) -> AttemptResult:
         self.calls += 1
         if self.calls % 2 == 1:
             (worktree / "calculator.py").write_text("def add(a, b):\n    return a + b\n")

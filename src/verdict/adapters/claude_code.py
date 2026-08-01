@@ -10,9 +10,10 @@ exactly what AttemptResult needs.
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 
+from verdict.sandbox import Sandbox
+from verdict.sandbox.config import fallback_sandbox
 from verdict.schema import AttemptResult
 
 # Generous: real coding tasks can involve many tool calls and file reads.
@@ -34,7 +35,7 @@ class ClaudeCodeAdapter:
     def __init__(self, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> None:
         self._timeout_seconds = timeout_seconds
 
-    def run(self, task: str, worktree: Path) -> AttemptResult:
+    def run(self, task: str, worktree: Path, sandbox: Sandbox | None = None) -> AttemptResult:
         command = [
             "claude",
             "-p",
@@ -44,23 +45,16 @@ class ClaudeCodeAdapter:
             "--permission-mode",
             "acceptEdits",
         ]
-        try:
-            result = subprocess.run(
-                command,
-                cwd=worktree,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout_seconds,
-            )
-        except FileNotFoundError as exc:
+        result = (sandbox or fallback_sandbox()).exec(
+            command, cwd=worktree, timeout_seconds=self._timeout_seconds
+        )
+        if result.exit_code == 127:
             raise ClaudeCodeAdapterError(
                 "`claude` CLI not found on PATH. Install Claude Code, or use "
                 "--agent mock to exercise the pipeline without it."
-            ) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise ClaudeCodeAdapterError(
-                f"claude did not finish within {self._timeout_seconds}s"
-            ) from exc
+            )
+        if result.timed_out:
+            raise ClaudeCodeAdapterError(f"claude did not finish within {self._timeout_seconds}s")
 
         payload: dict[str, object] = {}
         if result.stdout.strip():
@@ -69,9 +63,9 @@ class ClaudeCodeAdapter:
             except json.JSONDecodeError:
                 payload = {}
 
-        if result.returncode != 0 and not payload:
+        if result.exit_code != 0 and not payload:
             raise ClaudeCodeAdapterError(
-                f"claude exited {result.returncode}:\n{result.stderr.strip()}"
+                f"claude exited {result.exit_code}:\n{result.stderr.strip()}"
             )
 
         usage_raw = payload.get("usage", {})

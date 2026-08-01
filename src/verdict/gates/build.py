@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 
 from verdict.gates.base import ToolRunner, exec_command, tail
+from verdict.sandbox import Sandbox
 from verdict.schema import GateStatus, Provenance, Signal
 
 
@@ -39,9 +40,9 @@ class NpmBuildRunner:
             return False
         return "build" in data.get("scripts", {})
 
-    def run(self, worktree: Path) -> Signal:
+    def run(self, worktree: Path, sandbox: Sandbox | None = None) -> Signal:
         command = ["npm", "run", "build", "--silent"]
-        result = exec_command(command, cwd=worktree)
+        result = exec_command(command, cwd=worktree, sandbox=sandbox)
         detail = tail(result.stdout + result.stderr)
         status = GateStatus.PASS if result.returncode == 0 else GateStatus.FAIL
         return Signal(

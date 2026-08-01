@@ -1,27 +1,17 @@
 """Starts and tears down the repo's own frontend dev server (`frontend.start`
 in `verdict.yml`) around a block of Playwright checks.
 
-Two choices worth calling out, both mirroring decisions already made
-elsewhere in this codebase for the same reasons:
-
-- **`shell=True`, no argv parsing.** `frontend.start` is a user-supplied
-  string, exactly like the `verdict.yml` gate overrides in `gates/base.py`'s
-  `raw_signal` — we don't control the invocation, so there's no structured
-  command to build, and this is the one place `shell=True` is a considered
-  exception rather than an oversight.
-- **`start_new_session=True`.** A dev server started via `npm run dev`
-  usually forks a real child process (node) that outlives the shell if
-  killed directly — a plain `proc.terminate()` would leave that child
-  running and its port bound. Starting a new process group lets teardown
-  kill the whole group at once.
+`frontend.start` is a raw shell string sourced from the repo being graded —
+exactly like the `verdict.yml` gate overrides in `gates/base.py`'s
+`raw_signal`. Before Phase 8 this ran via host `shell=True`; now it's
+wrapped as `["sh", "-c", command]` and handed to a `Sandbox`, so the shell
+interpretation happens inside the sandbox boundary, and process-tree
+teardown (the old `os.killpg`/process-group dance) is the `Sandbox`
+backend's job (`BackgroundHandle.terminate()`), not this module's.
 """
 
 from __future__ import annotations
 
-import os
-import signal
-import subprocess
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -29,8 +19,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from verdict.sandbox import Sandbox
+
 _POLL_INTERVAL_SECONDS = 0.25
-_TERMINATE_GRACE_SECONDS = 5
 
 
 class FrontendServerError(RuntimeError):
@@ -57,66 +48,43 @@ def _url_is_ready(url: str) -> bool:
         return False
 
 
-def _terminate(proc: subprocess.Popen[str]) -> None:
-    if proc.poll() is not None:
-        return
-    try:
-        pgid = os.getpgid(proc.pid)
-    except ProcessLookupError:
-        return
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-        proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
-    except ProcessLookupError:
-        pass
-
-
 @contextmanager
 def dev_server(
-    command: str, cwd: Path, url: str, ready_timeout_seconds: int
+    command: str,
+    cwd: Path,
+    url: str,
+    ready_timeout_seconds: int,
+    sandbox: Sandbox,
 ) -> Iterator[None]:
-    """Run `command` in `cwd`, poll `url` until it answers (or the process
-    exits, or the timeout elapses), yield once ready, and always tear the
-    process group down afterward — regardless of what the caller does with
-    it. Output is captured to a temp file (not a pipe) so a chatty dev
-    server can never deadlock this process by filling an unread pipe buffer.
+    """Run `command` in `cwd` inside `sandbox`, poll `url` until it answers
+    (or the process exits, or the timeout elapses), yield once ready, and
+    always tear the background process down afterward — regardless of what
+    the caller does with it.
+
+    `network=True`: a dev server that can't reach the loopback address (or,
+    for many frameworks, the wider network for HMR/asset fetching) can't be
+    reasonably graded as "broken" by Phase 8's sandbox — this is the same
+    conservative call `runner.py`'s install-step boundary makes explicit
+    elsewhere. It's a real, intentional exception to gates' network-off
+    default, not an oversight; see DESIGN.md's Phase 8 section.
     """
-    log_file = tempfile.TemporaryFile(mode="w+")
-    proc = subprocess.Popen(
-        command,
-        shell=True,
-        cwd=cwd,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,
-    )
+    handle = sandbox.exec_background(["sh", "-c", command], cwd=cwd, network=True)
     try:
         deadline = time.monotonic() + ready_timeout_seconds
         while True:
-            if proc.poll() is not None:
-                log_file.seek(0)
+            if not handle.is_alive():
                 raise FrontendServerError(
-                    f"frontend dev server (`{command}`) exited early "
-                    f"(code {proc.returncode}) before answering at {url}:\n"
-                    f"{_tail(log_file.read())}"
+                    f"frontend dev server (`{command}`) exited early before answering at "
+                    f"{url}:\n{_tail(handle.read_output())}"
                 )
             if _url_is_ready(url):
                 break
             if time.monotonic() >= deadline:
-                log_file.seek(0)
                 raise FrontendServerError(
                     f"frontend dev server (`{command}`) did not answer at {url} "
-                    f"within {ready_timeout_seconds}s:\n{_tail(log_file.read())}"
+                    f"within {ready_timeout_seconds}s:\n{_tail(handle.read_output())}"
                 )
             time.sleep(_POLL_INTERVAL_SECONDS)
         yield
     finally:
-        _terminate(proc)
-        log_file.close()
+        handle.terminate()

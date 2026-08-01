@@ -150,7 +150,7 @@ def test_gate_cli_end_to_end_against_the_sample_repo_example(tmp_path: Path) -> 
     result = CliRunner().invoke(
         app,
         [
-            "gate", "--repo", str(repo), "--base", base,
+            "gate", "--repo", str(repo), "--base", base, "--sandbox-backend", "local",
             "--report", "json", "--report", "html", "--output-dir", str(output_dir),
         ],
     )
@@ -177,7 +177,10 @@ def test_gate_cli_end_to_end_fails_when_the_pr_does_not_fix_the_bug(tmp_path: Pa
     output_dir = tmp_path / "verdict-report"
     result = CliRunner().invoke(
         app,
-        ["gate", "--repo", str(repo), "--base", base, "--report", "json", "--output-dir", str(output_dir)],
+        [
+            "gate", "--repo", str(repo), "--base", base, "--sandbox-backend", "local",
+            "--report", "json", "--output-dir", str(output_dir),
+        ],
     )
 
     assert result.exit_code == 1

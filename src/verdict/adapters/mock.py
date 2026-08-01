@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from verdict.sandbox import Sandbox
 from verdict.schema import AttemptResult
 
 
@@ -24,7 +25,7 @@ class MockAdapter:
             raise ValueError("MockAdapter needs at least one patch to apply")
         self._patches = patches
 
-    def run(self, task: str, worktree: Path) -> AttemptResult:
+    def run(self, task: str, worktree: Path, sandbox: Sandbox | None = None) -> AttemptResult:
         for relative_path, contents in self._patches.items():
             target = worktree / relative_path
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -60,8 +61,8 @@ class SuiteMockAdapter:
             raise ValueError("SuiteMockAdapter needs at least one task's patches")
         self._patches_by_task = patches_by_task
 
-    def run(self, task: str, worktree: Path) -> AttemptResult:
+    def run(self, task: str, worktree: Path, sandbox: Sandbox | None = None) -> AttemptResult:
         patches = self._patches_by_task.get(task)
         if patches is None:
             raise ValueError(f"SuiteMockAdapter has no canned patch for task: {task!r}")
-        return MockAdapter(patches=patches).run(task, worktree)
+        return MockAdapter(patches=patches).run(task, worktree, sandbox=sandbox)

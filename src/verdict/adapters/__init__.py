@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
+from verdict.sandbox import Sandbox
 from verdict.schema import AttemptResult
 
 
@@ -20,9 +21,15 @@ class Adapter(Protocol):
 
     name: str
 
-    def run(self, task: str, worktree: Path) -> AttemptResult:
+    def run(self, task: str, worktree: Path, sandbox: Sandbox | None = None) -> AttemptResult:
         """Drive the agent on `task` inside `worktree`, then return its diff
         and token/cost accounting. Must not raise on the agent merely
         failing the task — only on the adapter itself being unable to run.
+
+        `sandbox` is how the agent's own CLI actually executes (Phase 8) —
+        None only from callers that haven't been threaded through
+        explicitly (falls back to an unsafe local execution — see
+        sandbox/config.py's `fallback_sandbox`); `runner.py`'s real entry
+        points always pass one.
         """
         ...

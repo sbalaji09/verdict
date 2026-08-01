@@ -118,7 +118,7 @@ class _FlakyThenFixAdapter:
         self._fix_patches = fix_patches
         self.calls_by_task: dict[str, int] = {}
 
-    def run(self, task: str, worktree: Path) -> AttemptResult:
+    def run(self, task: str, worktree: Path, sandbox=None) -> AttemptResult:
         self.calls_by_task[task] = self.calls_by_task.get(task, 0) + 1
         if self.calls_by_task[task] >= 2:
             for relative_path, contents in self._fix_patches[task].items():

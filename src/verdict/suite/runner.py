@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from verdict.adapters import Adapter
 from verdict.runner import DEFAULT_MAX_ATTEMPTS, run_with_retries
+from verdict.sandbox import SandboxConfig
 from verdict.schema import ConfigResult
 from verdict.suite.loader import SuiteTask
 
@@ -35,6 +36,7 @@ def run_suite(
     tasks: list[SuiteTask],
     configs: list[BenchConfig],
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    sandbox_config: SandboxConfig | None = None,
 ) -> list[ConfigResult]:
     """Every config runs against every task, independently — one config's
     cost or failure has no bearing on another's, and one task's result
@@ -46,7 +48,11 @@ def run_suite(
     for config in configs:
         task_runs = [
             run_with_retries(
-                task=task.task, repo=task.repo, adapter=config.adapter, max_attempts=max_attempts
+                task=task.task,
+                repo=task.repo,
+                adapter=config.adapter,
+                max_attempts=max_attempts,
+                sandbox_config=sandbox_config,
             )
             for task in tasks
         ]

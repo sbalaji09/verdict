@@ -38,6 +38,8 @@ from verdict.frontend.glitch import GlitchScanResult, scan_for_glitches
 from verdict.frontend.server import FrontendServerError, dev_server
 from verdict.frontend.vision_judge import MockVisionJudge, VisionJudge, to_signal
 from verdict.frontend.visual_diff import perceptual_diff_ratio
+from verdict.sandbox import Sandbox
+from verdict.sandbox.config import fallback_sandbox
 from verdict.schema import GateStatus, Provenance, Signal
 from verdict.worktree import Worktree, copy_vendored_dependencies, scratch_worktree
 
@@ -65,13 +67,26 @@ def run_frontend_checks(
     config: VerdictConfig,
     task: str,
     vision_judge: VisionJudge | None = None,
+    sandbox: Sandbox | None = None,
 ) -> list[Signal]:
     """Empty list if `verdict.yml` has no `frontend:` section — frontend
     checks are entirely opt-in, same as the gate overrides they sit
-    alongside."""
+    alongside.
+
+    KNOWN GAP (see DESIGN.md Phase 8): the dev server itself now runs
+    inside `sandbox`, but the Chromium browser Playwright drives below
+    still launches directly on the host, not inside the sandbox's network
+    namespace — it reaches the dev server via a published/loopback port
+    the same way it always has. Since the dev server's own code is agent-
+    authored, and the page it serves is rendered by this host-side
+    browser, arbitrary agent-authored JS still executes renderer-side,
+    outside the sandbox boundary. Containerizing the browser too (e.g. via
+    Playwright's own remote-server mode) is deferred, not implemented here.
+    """
     frontend = config.frontend
     if frontend is None:
         return []
+    sandbox = sandbox or fallback_sandbox()
 
     if sync_playwright is None:
         return [
@@ -97,9 +112,9 @@ def run_frontend_checks(
         with sync_playwright() as pw:
             browser = pw.chromium.launch()
             try:
-                before_shots, before_error = _capture_before(repo, worktree, frontend, browser)
+                before_shots, before_error = _capture_before(repo, worktree, frontend, browser, sandbox)
                 after_shots, check_signals = _capture_after_and_run_checks(
-                    worktree.path, frontend, judge, browser, video_dir
+                    worktree.path, frontend, judge, browser, video_dir, sandbox
                 )
             finally:
                 browser.close()
@@ -213,7 +228,7 @@ def _load_glitch_scan(
 
 
 def _capture_before(
-    repo: Path, worktree: Worktree, frontend: FrontendConfig, browser: Browser
+    repo: Path, worktree: Worktree, frontend: FrontendConfig, browser: Browser, sandbox: Sandbox
 ) -> tuple[dict[int, bytes], str | None]:
     """Render `worktree.base_commit` — the repo exactly as it was before the
     agent touched anything — in a disposable scratch worktree, so the
@@ -223,7 +238,9 @@ def _capture_before(
     try:
         with scratch_worktree(repo, worktree.base_commit) as base_path:
             copy_vendored_dependencies(repo, base_path)
-            with dev_server(frontend.start, base_path, frontend.url, frontend.ready_timeout_seconds):
+            with dev_server(
+                frontend.start, base_path, frontend.url, frontend.ready_timeout_seconds, sandbox
+            ):
                 shots = {
                     vw: _screenshot(browser, frontend.url, vw, frontend.viewport_height)
                     for vw in frontend.viewports
@@ -239,9 +256,12 @@ def _capture_after_and_run_checks(
     judge: VisionJudge,
     browser: Browser,
     video_dir: Path | None,
+    sandbox: Sandbox,
 ) -> tuple[dict[int, bytes], list[Signal]]:
     try:
-        with dev_server(frontend.start, worktree_path, frontend.url, frontend.ready_timeout_seconds):
+        with dev_server(
+            frontend.start, worktree_path, frontend.url, frontend.ready_timeout_seconds, sandbox
+        ):
             after_shots: dict[int, bytes] = {}
             glitch_signals: list[Signal] = []
             primary_shot: bytes | None = None

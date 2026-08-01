@@ -35,11 +35,33 @@ from verdict.report import render_task_run
 from verdict.report_html import render_html
 from verdict.report_json import render_json
 from verdict.runner import grade_existing_diff, run_with_retries
+from verdict.sandbox import ResourceLimits, SandboxConfig
 from verdict.schema import ConfigResult, TaskRun
 from verdict.suite import BenchConfig, SuiteLoadError, load_suite, run_suite
 from verdict.worktree import WorktreeError
 
 app = typer.Typer(add_completion=False, help="Grade AI coding agents on executable truth.")
+
+_SANDBOX_BACKEND_HELP = (
+    "How agent-influenced code actually executes: \"docker\" (default — an "
+    "isolated, network-off-by-default container) or \"local\" (no "
+    "isolation at all, prints an UNSAFE warning — trusted-repo local dev "
+    "only). See DESIGN.md's Phase 8 section."
+)
+
+
+def _build_sandbox_config(
+    sandbox_backend: str, sandbox_image: str, sandbox_cpus: float, sandbox_memory_mb: int
+) -> SandboxConfig:
+    if sandbox_backend not in ("docker", "local"):
+        raise typer.BadParameter(f"unknown --sandbox-backend: {sandbox_backend!r} (choices: docker, local)")
+    return SandboxConfig(
+        backend=sandbox_backend,  # type: ignore[arg-type]
+        image=sandbox_image,
+        limits=ResourceLimits(cpu_cores=sandbox_cpus, memory_mb=sandbox_memory_mb),
+    )
+
+
 
 # Every adapter this CLI can drive by name, beyond `mock` (which needs a
 # per-repo or per-task canned patch, handled separately below). One entry
@@ -230,6 +252,14 @@ def run_cmd(
     output_dir: Path = typer.Option(
         Path("verdict-report"), "--output-dir", help="Where json/html reports are written."
     ),
+    sandbox_backend: str = typer.Option("docker", "--sandbox-backend", help=_SANDBOX_BACKEND_HELP),
+    sandbox_image: str = typer.Option(
+        "verdict-sandbox:0.1.0", "--sandbox-image", help="Image DockerSandbox runs."
+    ),
+    sandbox_cpus: float = typer.Option(2.0, "--sandbox-cpus", help="CPU limit passed to DockerSandbox."),
+    sandbox_memory_mb: int = typer.Option(
+        2048, "--sandbox-memory-mb", help="Memory limit (MB) passed to DockerSandbox."
+    ),
 ) -> None:
     """Run an agent against one task (retrying on failure if --max-attempts > 1)
     and print its Verdict plus the cost across every attempt made.
@@ -239,8 +269,11 @@ def run_cmd(
     (see README's Configuration section).
     """
     adapter = _build_adapter(agent, repo)
+    sandbox_config = _build_sandbox_config(sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb)
     try:
-        task_run = run_with_retries(task=task, repo=repo, adapter=adapter, max_attempts=max_attempts)
+        task_run = run_with_retries(
+            task=task, repo=repo, adapter=adapter, max_attempts=max_attempts, sandbox_config=sandbox_config
+        )
     except _RUN_ERRORS as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
@@ -273,6 +306,14 @@ def bench_cmd(
     output_dir: Path = typer.Option(
         Path("verdict-report"), "--output-dir", help="Where json/html reports are written."
     ),
+    sandbox_backend: str = typer.Option("docker", "--sandbox-backend", help=_SANDBOX_BACKEND_HELP),
+    sandbox_image: str = typer.Option(
+        "verdict-sandbox:0.1.0", "--sandbox-image", help="Image DockerSandbox runs."
+    ),
+    sandbox_cpus: float = typer.Option(2.0, "--sandbox-cpus", help="CPU limit passed to DockerSandbox."),
+    sandbox_memory_mb: int = typer.Option(
+        2048, "--sandbox-memory-mb", help="Memory limit (MB) passed to DockerSandbox."
+    ),
 ) -> None:
     """Run every --agent against every task in --suite, then print a
     pass-rate-per-dollar leaderboard and a failure-mode breakdown.
@@ -287,9 +328,10 @@ def bench_cmd(
         raise typer.Exit(code=2) from exc
 
     configs = [BenchConfig(label=name, adapter=_build_bench_adapter(name)) for name in agent]
+    sandbox_config = _build_sandbox_config(sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb)
 
     try:
-        results = run_suite(tasks, configs, max_attempts=max_attempts)
+        results = run_suite(tasks, configs, max_attempts=max_attempts, sandbox_config=sandbox_config)
     except _RUN_ERRORS as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
@@ -313,6 +355,14 @@ def gate_cmd(
     output_dir: Path = typer.Option(
         Path("verdict-report"), "--output-dir", help="Where json/html reports are written."
     ),
+    sandbox_backend: str = typer.Option("docker", "--sandbox-backend", help=_SANDBOX_BACKEND_HELP),
+    sandbox_image: str = typer.Option(
+        "verdict-sandbox:0.1.0", "--sandbox-image", help="Image DockerSandbox runs."
+    ),
+    sandbox_cpus: float = typer.Option(2.0, "--sandbox-cpus", help="CPU limit passed to DockerSandbox."),
+    sandbox_memory_mb: int = typer.Option(
+        2048, "--sandbox-memory-mb", help="Memory limit (MB) passed to DockerSandbox."
+    ),
 ) -> None:
     """Grade `--repo` exactly as it's already checked out against `--base`
     — no adapter, no isolation. This is the merge-gate command: a pull
@@ -322,8 +372,9 @@ def gate_cmd(
     gate policy this enforces: any failing PROVEN signal fails the check;
     JUDGED signals never do.
     """
+    sandbox_config = _build_sandbox_config(sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb)
     try:
-        verdict = grade_existing_diff(repo=repo, base_ref=base)
+        verdict = grade_existing_diff(repo=repo, base_ref=base, sandbox_config=sandbox_config)
     except WorktreeError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
@@ -399,6 +450,14 @@ def flaky_cmd(
     json_out: Path | None = typer.Option(
         None, "--json", help="Write this run's FlakinessResult to this path (for a later --compare-to)."
     ),
+    sandbox_backend: str = typer.Option("docker", "--sandbox-backend", help=_SANDBOX_BACKEND_HELP),
+    sandbox_image: str = typer.Option(
+        "verdict-sandbox:0.1.0", "--sandbox-image", help="Image DockerSandbox runs."
+    ),
+    sandbox_cpus: float = typer.Option(2.0, "--sandbox-cpus", help="CPU limit passed to DockerSandbox."),
+    sandbox_memory_mb: int = typer.Option(
+        2048, "--sandbox-memory-mb", help="Memory limit (MB) passed to DockerSandbox."
+    ),
 ) -> None:
     """Run `--agent` on `--task` against `--repo` `--trials` independent
     times and report the pass rate with a Wilson confidence interval. With
@@ -411,8 +470,11 @@ def flaky_cmd(
     paid agent without budgeting for it.
     """
     adapter = _build_adapter(agent, repo)
+    sandbox_config = _build_sandbox_config(sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb)
     try:
-        result = run_flakiness(task=task, repo=repo, adapter=adapter, trials=trials)
+        result = run_flakiness(
+            task=task, repo=repo, adapter=adapter, trials=trials, sandbox_config=sandbox_config
+        )
     except _RUN_ERRORS as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc

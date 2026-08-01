@@ -17,9 +17,10 @@ adapter.
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 
+from verdict.sandbox import Sandbox
+from verdict.sandbox.config import fallback_sandbox
 from verdict.schema import AttemptResult
 
 DEFAULT_TIMEOUT_SECONDS = 900
@@ -39,7 +40,7 @@ class CursorAdapter:
     def __init__(self, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> None:
         self._timeout_seconds = timeout_seconds
 
-    def run(self, task: str, worktree: Path) -> AttemptResult:
+    def run(self, task: str, worktree: Path, sandbox: Sandbox | None = None) -> AttemptResult:
         command = [
             "cursor-agent",
             "-p",
@@ -48,23 +49,16 @@ class CursorAdapter:
             "json",
             "-f",  # force: auto-accept edits, no interactive permission prompts
         ]
-        try:
-            result = subprocess.run(
-                command,
-                cwd=worktree,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout_seconds,
-            )
-        except FileNotFoundError as exc:
+        result = (sandbox or fallback_sandbox()).exec(
+            command, cwd=worktree, timeout_seconds=self._timeout_seconds
+        )
+        if result.exit_code == 127:
             raise CursorAdapterError(
                 "`cursor-agent` CLI not found on PATH. Install Cursor's CLI, or use "
                 "--agent mock to exercise the pipeline without it."
-            ) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise CursorAdapterError(
-                f"cursor-agent did not finish within {self._timeout_seconds}s"
-            ) from exc
+            )
+        if result.timed_out:
+            raise CursorAdapterError(f"cursor-agent did not finish within {self._timeout_seconds}s")
 
         payload: dict[str, object] = {}
         if result.stdout.strip():
@@ -73,9 +67,9 @@ class CursorAdapter:
             except json.JSONDecodeError:
                 payload = {}
 
-        if result.returncode != 0 and not payload:
+        if result.exit_code != 0 and not payload:
             raise CursorAdapterError(
-                f"cursor-agent exited {result.returncode}:\n{result.stderr.strip()}"
+                f"cursor-agent exited {result.exit_code}:\n{result.stderr.strip()}"
             )
 
         usage_raw = payload.get("usage", {})

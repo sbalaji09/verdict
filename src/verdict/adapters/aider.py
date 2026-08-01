@@ -16,9 +16,10 @@ producing one.
 from __future__ import annotations
 
 import re
-import subprocess
 from pathlib import Path
 
+from verdict.sandbox import Sandbox
+from verdict.sandbox.config import fallback_sandbox
 from verdict.schema import AttemptResult
 
 DEFAULT_TIMEOUT_SECONDS = 900
@@ -42,34 +43,29 @@ class AiderAdapter:
     def __init__(self, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> None:
         self._timeout_seconds = timeout_seconds
 
-    def run(self, task: str, worktree: Path) -> AttemptResult:
+    def run(self, task: str, worktree: Path, sandbox: Sandbox | None = None) -> AttemptResult:
         command = ["aider", "--message", task, "--yes-always"]
-        try:
-            result = subprocess.run(
-                command,
-                cwd=worktree,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout_seconds,
-            )
-        except FileNotFoundError as exc:
+        result = (sandbox or fallback_sandbox()).exec(
+            command, cwd=worktree, timeout_seconds=self._timeout_seconds
+        )
+        if result.exit_code == 127:
             raise AiderAdapterError(
                 "`aider` CLI not found on PATH. Install Aider, or use "
                 "--agent mock to exercise the pipeline without it."
-            ) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise AiderAdapterError(f"aider did not finish within {self._timeout_seconds}s") from exc
+            )
+        if result.timed_out:
+            raise AiderAdapterError(f"aider did not finish within {self._timeout_seconds}s")
 
         output = result.stdout + result.stderr
         tokens_input, tokens_output = _parse_tokens(output)
         cost_usd = _parse_session_cost(output)
 
-        if result.returncode != 0 and tokens_input == 0 and tokens_output == 0 and cost_usd is None:
+        if result.exit_code != 0 and tokens_input == 0 and tokens_output == 0 and cost_usd is None:
             # No usable summary *and* a nonzero exit — genuinely couldn't run,
             # as opposed to running and merely failing the task (which still
             # produces a token/cost summary and should fall through to a
             # normal AttemptResult for the gates to grade).
-            raise AiderAdapterError(f"aider exited {result.returncode}:\n{result.stderr.strip()}")
+            raise AiderAdapterError(f"aider exited {result.exit_code}:\n{result.stderr.strip()}")
 
         return AttemptResult(
             diff="",

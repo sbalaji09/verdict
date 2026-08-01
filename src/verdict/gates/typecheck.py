@@ -23,6 +23,7 @@ import subprocess
 from pathlib import Path
 
 from verdict.gates.base import ToolRunner, exec_command, tail
+from verdict.sandbox import Sandbox
 from verdict.schema import FailureLocation, GateStatus, Provenance, Signal
 
 _TSC_ERROR_RE = re.compile(
@@ -62,10 +63,10 @@ class TscRunner:
             worktree / "node_modules" / ".bin" / "tsc"
         ).exists()
 
-    def run(self, worktree: Path) -> Signal:
+    def run(self, worktree: Path, sandbox: Sandbox | None = None) -> Signal:
         binary = str(worktree / "node_modules" / ".bin" / "tsc")
         command = [binary, "--noEmit", "--pretty", "false"]
-        result = exec_command(command, cwd=worktree)
+        result = exec_command(command, cwd=worktree, sandbox=sandbox)
         detail, status, failures = _parse_tsc(result)
         return Signal(
             name=self.gate,
@@ -118,9 +119,9 @@ class MypyRunner:
         pyproject = worktree / "pyproject.toml"
         return pyproject.exists() and "[tool.mypy" in pyproject.read_text(errors="ignore")
 
-    def run(self, worktree: Path) -> Signal:
+    def run(self, worktree: Path, sandbox: Sandbox | None = None) -> Signal:
         command = ["mypy", "--output", "json", "."]
-        result = exec_command(command, cwd=worktree)
+        result = exec_command(command, cwd=worktree, sandbox=sandbox)
         detail, status, failures = _parse_mypy(result)
         return Signal(
             name=self.gate,

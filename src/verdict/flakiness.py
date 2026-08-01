@@ -34,6 +34,7 @@ from rich.table import Table
 
 from verdict.adapters import Adapter
 from verdict.runner import run
+from verdict.sandbox import SandboxConfig
 
 DEFAULT_TRIALS = 10
 DEFAULT_CONFIDENCE_LEVEL = 0.95
@@ -126,6 +127,7 @@ def run_flakiness(
     adapter: Adapter,
     trials: int = DEFAULT_TRIALS,
     confidence_level: float = DEFAULT_CONFIDENCE_LEVEL,
+    sandbox_config: SandboxConfig | None = None,
 ) -> FlakinessResult:
     """Run `adapter` on `task` against `repo` `trials` independent times —
     each its own fresh `runner.run()` call, its own worktree, its own
@@ -142,7 +144,7 @@ def run_flakiness(
     total_cost = 0.0
     cost_known = True
     for _ in range(trials):
-        verdict = run(task=task, repo=repo, adapter=adapter)
+        verdict = run(task=task, repo=repo, adapter=adapter, sandbox_config=sandbox_config)
         if verdict.done:
             passes += 1
         if verdict.attempt.cost_usd is None:

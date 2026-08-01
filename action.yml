@@ -70,7 +70,13 @@ runs:
       continue-on-error: true
       run: |
         set +e
+        # --sandbox-backend local: `verdict gate`'s own default is
+        # DockerSandbox (Phase 8), which needs the verdict-sandbox image
+        # pulled/built on the runner — no published image/registry story
+        # exists yet, so this action pins `local` as a stopgap rather than
+        # silently failing every consumer. See DESIGN.md's Phase 8 section.
         verdict gate --repo "${{ inputs.repo }}" --base "${{ inputs.base-ref }}" \
+          --sandbox-backend local \
           --report cli --report json --report html --output-dir verdict-report
         code=$?
         set -e

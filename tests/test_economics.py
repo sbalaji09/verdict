@@ -189,7 +189,7 @@ class _FlakyThenFixAdapter:
     def __init__(self) -> None:
         self.calls = 0
 
-    def run(self, task: str, worktree: Path) -> AttemptResult:
+    def run(self, task: str, worktree: Path, sandbox=None) -> AttemptResult:
         self.calls += 1
         if self.calls >= 3:
             (worktree / "calculator.py").write_text("def add(a, b):\n    return a + b\n")
@@ -212,7 +212,7 @@ def test_run_with_retries_stops_at_max_attempts_if_never_done(git_repo: Path) ->
     class AlwaysFailsAdapter:
         name = "always-fails"
 
-        def run(self, task: str, worktree: Path) -> AttemptResult:
+        def run(self, task: str, worktree: Path, sandbox=None) -> AttemptResult:
             return AttemptResult(diff="", tokens_input=10, tokens_output=5, cost_usd=0.01)
 
     task_run = run_with_retries(task="t", repo=git_repo, adapter=AlwaysFailsAdapter(), max_attempts=3)
@@ -228,7 +228,7 @@ def test_run_with_retries_default_is_a_single_attempt(git_repo: Path) -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        def run(self, task: str, worktree: Path) -> AttemptResult:
+        def run(self, task: str, worktree: Path, sandbox=None) -> AttemptResult:
             self.calls += 1
             return AttemptResult(diff="", cost_usd=0.0)
 

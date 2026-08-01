@@ -27,9 +27,10 @@ versions, hence the defensive, line-by-line, `.get()`-based parsing below.
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 
+from verdict.sandbox import Sandbox
+from verdict.sandbox.config import fallback_sandbox
 from verdict.schema import AttemptResult
 
 DEFAULT_TIMEOUT_SECONDS = 900
@@ -49,7 +50,7 @@ class CodexAdapter:
     def __init__(self, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> None:
         self._timeout_seconds = timeout_seconds
 
-    def run(self, task: str, worktree: Path) -> AttemptResult:
+    def run(self, task: str, worktree: Path, sandbox: Sandbox | None = None) -> AttemptResult:
         command = [
             "codex",
             "exec",
@@ -58,26 +59,21 @@ class CodexAdapter:
             "--json",
             "--skip-git-repo-check",  # the worktree is a throwaway branch, not necessarily "trusted"
         ]
-        try:
-            result = subprocess.run(
-                command,
-                cwd=worktree,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout_seconds,
-            )
-        except FileNotFoundError as exc:
+        result = (sandbox or fallback_sandbox()).exec(
+            command, cwd=worktree, timeout_seconds=self._timeout_seconds
+        )
+        if result.exit_code == 127:
             raise CodexAdapterError(
                 "`codex` CLI not found on PATH. Install the Codex CLI, or use "
                 "--agent mock to exercise the pipeline without it."
-            ) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise CodexAdapterError(f"codex did not finish within {self._timeout_seconds}s") from exc
+            )
+        if result.timed_out:
+            raise CodexAdapterError(f"codex did not finish within {self._timeout_seconds}s")
 
         tokens_input, tokens_output, final_text = _parse_events(result.stdout)
 
-        if result.returncode != 0 and final_text is None:
-            raise CodexAdapterError(f"codex exited {result.returncode}:\n{result.stderr.strip()}")
+        if result.exit_code != 0 and final_text is None:
+            raise CodexAdapterError(f"codex exited {result.exit_code}:\n{result.stderr.strip()}")
 
         return AttemptResult(
             diff="",

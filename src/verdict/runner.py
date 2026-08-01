@@ -11,6 +11,8 @@ from verdict.attribution.engine import attribute_failures
 from verdict.config import VerdictConfig, load_config
 from verdict.frontend.runner import run_frontend_checks
 from verdict.gates.registry import run_all_gates
+from verdict.sandbox import SandboxConfig, create_sandbox
+from verdict.sandbox.install import run_install_step
 from verdict.schema import AttemptResult, TaskRun, Verdict
 from verdict.worktree import (
     Worktree,
@@ -29,40 +31,51 @@ def run(
     task: str,
     repo: Path,
     adapter: Adapter,
+    sandbox_config: SandboxConfig | None = None,
 ) -> Verdict:
     """Run `adapter` on `task` inside a throwaway worktree of `repo`, grade
     the result against every applicable gate (test/typecheck/build/lint),
     and return the Verdict. The worktree (and its branch) is always torn
     down before this returns, win or lose.
+
+    `sandbox_config` governs how the adapter's CLI, the install step, gates,
+    and the frontend dev server actually execute — see `sandbox/config.py`.
+    Defaults to `SandboxConfig()` (backend "local") when not given; the
+    `verdict` CLI itself passes an explicit config defaulting to "docker"
+    (Phase 8's actual product default) via its `--sandbox-backend` flag.
     """
+    sandbox_config = sandbox_config or SandboxConfig()
     with isolated_worktree(repo) as worktree:
         copy_vendored_dependencies(repo, worktree.path)
-        attempt = adapter.run(task, worktree.path)
-        diff, files_changed = diff_against_base(worktree.path, worktree.base_commit)
-        attempt = attempt.model_copy(update={"diff": diff, "files_changed": files_changed})
+        run_install_step(worktree.path, sandbox_config)
 
-        # Commit the agent's work now, before any gate runs — gates (pytest,
-        # mypy, ...) can leave their own artifacts (__pycache__, etc.) in the
-        # worktree as a side effect of executing, and attribution's bisection
-        # must never mistake a gate's own byproduct for something the agent
-        # changed. `attempt_commit` is what attribution treats as "final".
-        attempt_commit = commit_all(worktree.path, "verdict: attempt final state")
+        with create_sandbox(worktree.path, sandbox_config) as sandbox:
+            attempt = adapter.run(task, worktree.path, sandbox=sandbox)
+            diff, files_changed = diff_against_base(worktree.path, worktree.base_commit)
+            attempt = attempt.model_copy(update={"diff": diff, "files_changed": files_changed})
 
-        config = load_config(worktree.path)
-        attempt = _apply_pricing_fallback(attempt, config)
-        signals = run_all_gates(worktree.path, config)
-        attributions = attribute_failures(repo, worktree, attempt_commit, signals)
+            # Commit the agent's work now, before any gate runs — gates (pytest,
+            # mypy, ...) can leave their own artifacts (__pycache__, etc.) in the
+            # worktree as a side effect of executing, and attribution's bisection
+            # must never mistake a gate's own byproduct for something the agent
+            # changed. `attempt_commit` is what attribution treats as "final".
+            attempt_commit = commit_all(worktree.path, "verdict: attempt final state")
 
-        # Frontend checks run after gates/attribution, and their signals are
-        # appended afterward rather than folded into `signals` beforehand —
-        # attribution's bisector only knows the four gate names in
-        # gates/registry.py's GATE_RUNNERS, and would crash trying to
-        # `resolve_gate("frontend:...")`. A failing frontend check is real
-        # PROVEN evidence for Verdict.status either way; it's just not
-        # (yet) bisectable to a culprit file the way test/typecheck/build/
-        # lint failures are.
-        frontend_signals = run_frontend_checks(repo, worktree, config, task)
-        signals = signals + frontend_signals
+            config = load_config(worktree.path)
+            attempt = _apply_pricing_fallback(attempt, config)
+            signals = run_all_gates(worktree.path, config, sandbox=sandbox)
+            attributions = attribute_failures(repo, worktree, attempt_commit, signals, sandbox_config)
+
+            # Frontend checks run after gates/attribution, and their signals are
+            # appended afterward rather than folded into `signals` beforehand —
+            # attribution's bisector only knows the four gate names in
+            # gates/registry.py's GATE_RUNNERS, and would crash trying to
+            # `resolve_gate("frontend:...")`. A failing frontend check is real
+            # PROVEN evidence for Verdict.status either way; it's just not
+            # (yet) bisectable to a culprit file the way test/typecheck/build/
+            # lint failures are.
+            frontend_signals = run_frontend_checks(repo, worktree, config, task, sandbox=sandbox)
+            signals = signals + frontend_signals
 
     return Verdict(
         task=task,
@@ -74,7 +87,9 @@ def run(
     )
 
 
-def grade_existing_diff(repo: Path, base_ref: str) -> Verdict:
+def grade_existing_diff(
+    repo: Path, base_ref: str, sandbox_config: SandboxConfig | None = None
+) -> Verdict:
     """Grade `repo` exactly as it's already checked out against `base_ref`
     — no adapter, no worktree isolation. This is Phase 6's merge-gate entry
     point: a pull request's diff already exists as real commits sitting on
@@ -106,11 +121,15 @@ def grade_existing_diff(repo: Path, base_ref: str) -> Verdict:
     # `worktree.base_commit` as bisection's starting point; it never writes
     # through this path itself.
     worktree = Worktree(path=repo, branch="HEAD", base_commit=base_commit)
+    sandbox_config = sandbox_config or SandboxConfig()
 
     config = load_config(repo)
-    signals = run_all_gates(repo, config)
-    attributions = attribute_failures(repo, worktree, final_commit, signals)
-    signals = signals + run_frontend_checks(repo, worktree, config, task="pull request diff")
+    with create_sandbox(repo, sandbox_config) as sandbox:
+        signals = run_all_gates(repo, config, sandbox=sandbox)
+        attributions = attribute_failures(repo, worktree, final_commit, signals, sandbox_config)
+        signals = signals + run_frontend_checks(
+            repo, worktree, config, task="pull request diff", sandbox=sandbox
+        )
 
     return Verdict(
         task="grade existing diff",
@@ -139,6 +158,7 @@ def run_with_retries(
     repo: Path,
     adapter: Adapter,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    sandbox_config: SandboxConfig | None = None,
 ) -> TaskRun:
     """Attempt `task` up to `max_attempts` times, stopping early on the
     first DONE. Every attempt is kept — including failed, abandoned ones —
@@ -151,7 +171,7 @@ def run_with_retries(
     """
     attempts: list[Verdict] = []
     for _ in range(max(max_attempts, 1)):
-        verdict = run(task=task, repo=repo, adapter=adapter)
+        verdict = run(task=task, repo=repo, adapter=adapter, sandbox_config=sandbox_config)
         attempts.append(verdict)
         if verdict.done:
             break
