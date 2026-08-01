@@ -63,6 +63,8 @@ def _render_signals(verdict: Verdict) -> None:
                 console.print(Panel(s.detail, border_style="red", expand=False))
             elif s.status is GateStatus.NA:
                 console.print(f"      [dim]{s.detail}[/dim]")
+            if s.artifact_path:
+                console.print(f"      [dim]recording: {s.artifact_path}[/dim]")
         console.print()
 
     if judged:

@@ -75,6 +75,8 @@ frontend:
   viewports: [800]
   ready_timeout_seconds: 10
   screenshot_threshold: 0.02
+  glitch_capture_seconds: 0.3
+  glitch_frame_interval_seconds: 0.1
   checks:
     - name: cta
       dom:
@@ -102,6 +104,8 @@ def test_frontend_checks_pass_after_fix(frontend_repo: Path) -> None:
     assert _signal(verdict, "frontend:dom:cta").status is GateStatus.PASS
     assert _signal(verdict, "frontend:interaction:cta").status is GateStatus.PASS
     assert _signal(verdict, "frontend:visual_diff:800px").status is GateStatus.PASS
+    assert _signal(verdict, "frontend:glitch_scan:load").status is GateStatus.PASS
+    assert _signal(verdict, "frontend:glitch_scan:cta").status is GateStatus.PASS
     vision = _signal(verdict, "frontend:vision_intent:cta")
     assert vision.provenance is Provenance.JUDGED
     assert vision.status is GateStatus.PASS
@@ -163,3 +167,69 @@ frontend:
     assert setup_signals
     assert setup_signals[0].status is GateStatus.FAIL
     assert setup_signals[0].provenance is Provenance.PROVEN
+
+
+GLITCHY_INDEX_HTML = """<!doctype html><html><body style="margin:0">
+<div id="banner" style="display:none;width:100%;height:400px;background:red"></div>
+<script>
+  let visible = false;
+  setInterval(function () {
+    visible = !visible;
+    document.getElementById('banner').style.display = visible ? 'block' : 'none';
+  }, 120);
+</script>
+</body></html>"""
+
+
+@pytest.fixture
+def glitchy_frontend_repo(tmp_path: Path) -> Path:
+    """A page that keeps toggling a banner's visibility every 120ms — a
+    real, continuous flicker, not a one-shot flash — so the glitch scan has
+    a high chance of sampling it regardless of exact frame timing.
+    """
+    repo = tmp_path / "glitchy_frontend_repo"
+    repo.mkdir()
+    (repo / "index.html").write_text(GLITCHY_INDEX_HTML)
+
+    port = _free_port()
+    (repo / "verdict.yml").write_text(
+        f"""
+frontend:
+  start: "{sys.executable} -m http.server {port} --bind 127.0.0.1"
+  url: "http://127.0.0.1:{port}/index.html"
+  viewports: [800]
+  ready_timeout_seconds: 10
+  glitch_capture_seconds: 1.2
+  glitch_frame_interval_seconds: 0.1
+"""
+    )
+    _init_git_repo(repo)
+    return repo
+
+
+def test_glitch_scan_catches_a_real_flickering_page(glitchy_frontend_repo: Path) -> None:
+    adapter = MockAdapter(patches={"README.md": "noop\n"})
+    verdict = run(task="noop", repo=glitchy_frontend_repo, adapter=adapter)
+
+    load_scan = _signal(verdict, "frontend:glitch_scan:load")
+    assert load_scan.status is GateStatus.FAIL
+    assert load_scan.provenance is Provenance.PROVEN
+    assert verdict.status is VerdictStatus.NOT_DONE
+
+
+def test_glitch_scan_failure_keeps_its_video_recording(glitchy_frontend_repo: Path) -> None:
+    adapter = MockAdapter(patches={"README.md": "noop\n"})
+    verdict = run(task="noop", repo=glitchy_frontend_repo, adapter=adapter)
+
+    load_scan = _signal(verdict, "frontend:glitch_scan:load")
+    assert load_scan.artifact_path is not None
+    assert Path(load_scan.artifact_path).exists()
+
+
+def test_stable_page_glitch_scan_passes_and_discards_its_recording(frontend_repo: Path) -> None:
+    adapter = MockAdapter(patches={"index.html": FIXED_INDEX_HTML})
+    verdict = run(task="fix cta", repo=frontend_repo, adapter=adapter)
+
+    load_scan = _signal(verdict, "frontend:glitch_scan:load")
+    assert load_scan.status is GateStatus.PASS
+    assert load_scan.artifact_path is None

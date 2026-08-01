@@ -97,6 +97,11 @@ class Signal(BaseModel):
     command: str | None = None
     exit_code: int | None = None
     failures: list[FailureLocation] = Field(default_factory=list)
+    artifact_path: str | None = None
+    """Path to a supporting file too rich for `detail` to hold inline — e.g.
+    Phase 4's glitch-scan video recording. Only ever supporting evidence for
+    a PROVEN/JUDGED result already decided from other data; nothing reads
+    the artifact itself to decide status."""
 
 
 class AttemptResult(BaseModel):

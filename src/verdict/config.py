@@ -24,6 +24,14 @@ DEFAULT_SCREENSHOT_THRESHOLD = 0.02
 perceptual diff gate reports FAIL. Deliberately a fraction, not a raw pixel
 count, so the same config value is meaningful across viewport sizes."""
 
+DEFAULT_GLITCH_SCAN = True
+DEFAULT_GLITCH_CAPTURE_SECONDS = 1.5
+DEFAULT_GLITCH_FRAME_INTERVAL_SECONDS = 0.15
+DEFAULT_GLITCH_DIFF_THRESHOLD = 0.05
+"""Same fractional-diff meaning as `screenshot_threshold`, applied
+frame-to-frame within a burst rather than before-vs-after — see
+`frontend/glitch.py`."""
+
 
 @dataclass
 class DomSpec:
@@ -77,6 +85,10 @@ class FrontendConfig:
     screenshot_threshold: float = DEFAULT_SCREENSHOT_THRESHOLD
     vision_model: str | None = None
     checks: list[FrontendCheckSpec] = field(default_factory=list)
+    glitch_scan: bool = DEFAULT_GLITCH_SCAN
+    glitch_capture_seconds: float = DEFAULT_GLITCH_CAPTURE_SECONDS
+    glitch_frame_interval_seconds: float = DEFAULT_GLITCH_FRAME_INTERVAL_SECONDS
+    glitch_diff_threshold: float = DEFAULT_GLITCH_DIFF_THRESHOLD
 
 
 @dataclass
@@ -194,6 +206,16 @@ def _parse_frontend_config(data: dict[str, object]) -> FrontendConfig | None:
         ),
         vision_model=str(frontend["vision_model"]) if frontend.get("vision_model") else None,
         checks=_parse_checks(frontend.get("checks")),
+        glitch_scan=bool(frontend.get("glitch_scan", DEFAULT_GLITCH_SCAN)),
+        glitch_capture_seconds=float(
+            frontend.get("glitch_capture_seconds", DEFAULT_GLITCH_CAPTURE_SECONDS)
+        ),
+        glitch_frame_interval_seconds=float(
+            frontend.get("glitch_frame_interval_seconds", DEFAULT_GLITCH_FRAME_INTERVAL_SECONDS)
+        ),
+        glitch_diff_threshold=float(
+            frontend.get("glitch_diff_threshold", DEFAULT_GLITCH_DIFF_THRESHOLD)
+        ),
     )
 
 
