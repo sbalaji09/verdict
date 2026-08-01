@@ -13,10 +13,13 @@ from verdict.frontend.runner import run_frontend_checks
 from verdict.gates.registry import run_all_gates
 from verdict.schema import AttemptResult, TaskRun, Verdict
 from verdict.worktree import (
+    Worktree,
     commit_all,
     copy_vendored_dependencies,
     diff_against_base,
+    diff_between,
     isolated_worktree,
+    rev_parse,
 )
 
 DEFAULT_MAX_ATTEMPTS = 1
@@ -64,6 +67,54 @@ def run(
     return Verdict(
         task=task,
         agent=adapter.name,
+        repo=str(repo),
+        attempt=attempt,
+        signals=signals,
+        attributions=attributions,
+    )
+
+
+def grade_existing_diff(repo: Path, base_ref: str) -> Verdict:
+    """Grade `repo` exactly as it's already checked out against `base_ref`
+    — no adapter, no worktree isolation. This is Phase 6's merge-gate entry
+    point: a pull request's diff already exists as real commits sitting on
+    disk (a human or an agent produced it, Verdict doesn't need to know or
+    care which), so there's no task to hand an agent and nothing to
+    isolate — `repo` itself is graded in place.
+
+    Deliberately read-only with respect to git: `diff_between` never
+    stages anything (unlike `diff_against_base`), and `attribute_failures`'
+    bisection always runs inside its own disposable `scratch_worktree`s off
+    `repo` — never `repo`'s own working directory or index. The only thing
+    this function executes *in* `repo` is the gates/frontend checks
+    themselves (pytest, tsc, a dev server, ...), exactly as a CI job
+    already expects to happen in its own checkout.
+    """
+    repo = repo.resolve()
+    base_commit = rev_parse(repo, base_ref)
+    final_commit = rev_parse(repo, "HEAD")
+    diff, files_changed = diff_between(repo, base_commit, final_commit)
+
+    # cost_usd is None, not 0 — this diff wasn't produced by an adapter
+    # Verdict drove, so "what it cost" is simply not a question this mode
+    # answers, and reporting 0 would look like a real, known figure.
+    attempt = AttemptResult(diff=diff, files_changed=files_changed, cost_usd=None)
+
+    # A plain Worktree value pointing at the real checkout, not a fresh
+    # `isolated_worktree()` — attribute_failures only ever *reads*
+    # `worktree.path` (for the dependency graph scan) and reads
+    # `worktree.base_commit` as bisection's starting point; it never writes
+    # through this path itself.
+    worktree = Worktree(path=repo, branch="HEAD", base_commit=base_commit)
+
+    config = load_config(repo)
+    signals = run_all_gates(repo, config)
+    attributions = attribute_failures(repo, worktree, final_commit, signals)
+    signals = signals + run_frontend_checks(repo, worktree, config, task="pull request diff")
+
+    return Verdict(
+        task="grade existing diff",
+        agent="gate",
         repo=str(repo),
         attempt=attempt,
         signals=signals,

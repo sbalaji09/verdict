@@ -113,6 +113,22 @@ def diff_against_base(worktree_path: Path, base_commit: str) -> tuple[str, list[
     return diff, files
 
 
+def diff_between(repo: Path, base: str, final: str) -> tuple[str, list[str]]:
+    """A read-only counterpart to `diff_against_base`, for Phase 6's
+    merge-gate mode: grading a repo that's already checked out at `final`
+    (a real commit — a PR's tip — not an agent's possibly-uncommitted
+    edits), so there's nothing to stage. Unlike `diff_against_base`, this
+    never runs `git add -A` — mutating the index of a repo Verdict didn't
+    create (a CI runner's own checkout, not a throwaway worktree) would be
+    a real, unwanted side effect for a mode whose whole point is to grade
+    the repo *as found*.
+    """
+    diff = _run_git("diff", base, final, cwd=repo)
+    files_raw = _run_git("diff", "--name-only", base, final, cwd=repo)
+    files = [f for f in files_raw.splitlines() if f]
+    return diff, files
+
+
 def commit_all(worktree_path: Path, message: str) -> str:
     """Stage and commit everything currently in the worktree (including
     uncommitted agent edits), then return the resulting commit SHA. A no-op

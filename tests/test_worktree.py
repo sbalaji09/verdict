@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from verdict.worktree import WorktreeError, diff_against_base, isolated_worktree
+from verdict.worktree import WorktreeError, diff_against_base, diff_between, isolated_worktree
 
 
 def _branches(repo: Path) -> str:
@@ -76,6 +76,36 @@ def test_worktree_records_base_commit(git_repo: Path) -> None:
     ).stdout.strip()
     with isolated_worktree(git_repo) as wt:
         assert wt.base_commit == head
+
+
+def test_diff_between_reports_changed_files_without_staging_anything(git_repo: Path) -> None:
+    # Phase 6's merge-gate mode grades a repo that's already checked out —
+    # diff_between must never call `git add`, unlike diff_against_base,
+    # since mutating the caller's own index would be a real side effect
+    # on a repo Verdict didn't create.
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=git_repo, capture_output=True, text=True
+    ).stdout.strip()
+    (git_repo / "calculator.py").write_text("def add(a, b):\n    return a + b\n")
+    subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "fix"], cwd=git_repo, check=True)
+    final = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=git_repo, capture_output=True, text=True
+    ).stdout.strip()
+
+    status_before = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=git_repo, capture_output=True, text=True
+    ).stdout
+
+    diff, files = diff_between(git_repo, base, final)
+
+    status_after = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=git_repo, capture_output=True, text=True
+    ).stdout
+
+    assert files == ["calculator.py"]
+    assert "return a + b" in diff
+    assert status_before == status_after == ""  # nothing got staged
 
 
 def test_scratch_worktree_is_detached_and_cleans_up(git_repo: Path) -> None:
