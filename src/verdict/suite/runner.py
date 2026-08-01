@@ -6,16 +6,15 @@ Phase 0-3's full pipeline (isolation, gates, attribution, cost accounting)
 completely unchanged. A suite run is "do this many times, then aggregate,"
 not a different kind of grading.
 
-Phase 10's one addition: a `SandboxError` (sandbox provisioning failed, a
-declared service never became healthy, a setup step hung) from any one
-`(config, task)` pair is caught HERE, per task, rather than being left to
-crash the whole suite — see DESIGN.md's Phase 10 section on why this is
-the one place the ERROR-routing decision actually changes runner
-behavior: a single `verdict run`/`verdict gate` still lets the same
-exception propagate uncaught to the CLI boundary, exit code 2, no report
-at all. A suite grading dozens of (agent, task) combinations shouldn't
-lose everything else it already computed because one repo's Postgres
-never came up.
+Phase 10 taught `run_suite` to not lose an entire suite over one repo's
+Postgres never coming up. Phase 11 moved the actual catch-and-retry logic
+down into `runner.py::run_with_retries` itself (see its docstring, and
+`_run_attempt`'s bounded infra-retry loop) — `run_with_retries` now never
+lets `_EVALUATION_ERRORS` propagate at all, single `verdict run` included,
+so this module no longer needs its own catch site. `_run_task` below is
+now a thin, single-line wrapper again; kept as a named function (rather
+than calling `run_with_retries` inline in the list comprehension below)
+purely for readability at the call site.
 """
 
 from __future__ import annotations
@@ -23,10 +22,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from verdict.adapters import Adapter
-from verdict.runner import DEFAULT_MAX_ATTEMPTS, run_with_retries
+from verdict.runner import DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_ERROR_RETRIES, run_with_retries
 from verdict.sandbox import SandboxConfig
-from verdict.sandbox.base import SandboxError
-from verdict.schema import AttemptResult, ConfigResult, TaskRun, Verdict
+from verdict.schema import ConfigResult, TaskRun
 from verdict.suite.loader import SuiteTask
 
 
@@ -45,29 +43,20 @@ class BenchConfig:
 
 
 def _run_task(
-    task: SuiteTask, config: BenchConfig, max_attempts: int, sandbox_config: SandboxConfig | None
+    task: SuiteTask,
+    config: BenchConfig,
+    max_attempts: int,
+    sandbox_config: SandboxConfig | None,
+    max_error_retries: int,
 ) -> TaskRun:
-    try:
-        return run_with_retries(
-            task=task.task,
-            repo=task.repo,
-            adapter=config.adapter,
-            max_attempts=max_attempts,
-            sandbox_config=sandbox_config,
-        )
-    except SandboxError as exc:
-        # No real attempt happened — cost is genuinely 0, not unknown —
-        # and `signals`/`attributions` stay empty; `error` is what makes
-        # `Verdict.status` ERROR (see `schema.py`), never NOT_DONE.
-        errored = Verdict(
-            task=task.task,
-            agent=config.adapter.name,
-            repo=str(task.repo),
-            attempt=AttemptResult(diff="", files_changed=[], cost_usd=0.0),
-            signals=[],
-            error=str(exc),
-        )
-        return TaskRun(task=task.task, agent=config.adapter.name, repo=str(task.repo), attempts=[errored])
+    return run_with_retries(
+        task=task.task,
+        repo=task.repo,
+        adapter=config.adapter,
+        max_attempts=max_attempts,
+        sandbox_config=sandbox_config,
+        max_error_retries=max_error_retries,
+    )
 
 
 def run_suite(
@@ -75,6 +64,7 @@ def run_suite(
     configs: list[BenchConfig],
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     sandbox_config: SandboxConfig | None = None,
+    max_error_retries: int = DEFAULT_MAX_ERROR_RETRIES,
 ) -> list[ConfigResult]:
     """Every config runs against every task, independently — one config's
     cost or failure has no bearing on another's, and one task's result
@@ -84,6 +74,8 @@ def run_suite(
     """
     results: list[ConfigResult] = []
     for config in configs:
-        task_runs = [_run_task(task, config, max_attempts, sandbox_config) for task in tasks]
+        task_runs = [
+            _run_task(task, config, max_attempts, sandbox_config, max_error_retries) for task in tasks
+        ]
         results.append(ConfigResult(label=config.label, task_runs=task_runs))
     return results

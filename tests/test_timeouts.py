@@ -112,9 +112,13 @@ def test_run_all_gates_directly_reports_a_hang_as_fail_not_a_crash(infinite_loop
 def test_provisioning_timeout_raises_and_never_produces_a_signal(tmp_path: Path, monkeypatch) -> None:
     """`run_setup_step` raising `ProvisioningTimeoutError` must propagate
     all the way out of `runner.run()` uncaught — this is deliberately NOT
-    caught and turned into a gate Signal anywhere in the pipeline; the CLI
-    layer (`cli.py`'s `_RUN_ERRORS`) is where it finally gets handled, the
-    same way an adapter CLI hanging already was before this phase.
+    caught and turned into a gate Signal anywhere in the pipeline. As of
+    Phase 11, `run()` itself is still where this contract is tested
+    directly; callers built on top of it route it differently:
+    `run_with_retries` (`verdict run`/`verdict bench`) now catches it and
+    reports it as a `VerdictStatus.ERROR` `Verdict` (see
+    `test_error_retry.py`), while `grade_existing_diff` (`verdict gate`)
+    still lets it propagate to `cli.py`'s `_RUN_ERRORS`, unchanged.
     """
     import verdict.runner as runner_module
 

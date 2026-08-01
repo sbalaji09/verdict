@@ -6,11 +6,13 @@
 - `suite/runner.py`: a `SandboxError` from one `(config, task)` pair is
   caught per-task — the suite keeps going, everything else in the
   `ConfigResult` is unaffected.
-- `runner.py`: unchanged from Phase 9 — a single `run()`/`run_with_retries`
-  call still lets a `SandboxError` propagate uncaught (see
-  `test_timeouts.py`'s `test_provisioning_timeout_raises_and_never_produces_a_signal`
-  for that half of the contract; this file focuses on the suite path,
-  which is what Phase 10 actually adds).
+- `runner.py`: as of Phase 11, `run()` itself still lets a `SandboxError`
+  propagate uncaught (see `test_timeouts.py`'s
+  `test_provisioning_timeout_raises_and_never_produces_a_signal` for that
+  half of the contract) — but `run_with_retries` no longer does; see
+  `test_error_retry.py` for Phase 11's bounded auto-retry-then-ERROR
+  behavior, which is what `suite/runner.py` now relies on instead of its
+  own catch site.
 """
 
 from __future__ import annotations

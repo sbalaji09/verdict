@@ -8,17 +8,19 @@ import dataclasses
 import time
 from pathlib import Path
 
-from verdict.adapters import Adapter
+from verdict.adapters import Adapter, AdapterError
 from verdict.attribution.engine import attribute_failures
 from verdict.config import VerdictConfig, load_config
 from verdict.frontend.runner import run_frontend_checks
 from verdict.gates.registry import run_all_gates
 from verdict.sandbox import Sandbox, SandboxConfig, create_sandbox
+from verdict.sandbox.base import SandboxError
 from verdict.sandbox.install import run_setup_step
 from verdict.sandbox.services import ServiceSession, setup_services, teardown_services
-from verdict.schema import AttemptResult, Attribution, Signal, TaskRun, Verdict
+from verdict.schema import AttemptResult, Attribution, Signal, TaskRun, Verdict, VerdictStatus
 from verdict.worktree import (
     Worktree,
+    WorktreeError,
     commit_all,
     copy_vendored_dependencies,
     diff_against_base,
@@ -28,6 +30,32 @@ from verdict.worktree import (
 )
 
 DEFAULT_MAX_ATTEMPTS = 1
+
+DEFAULT_MAX_ERROR_RETRIES = 2
+"""How many extra times an ERROR-causing attempt (infra couldn't be
+evaluated at all) is automatically retried, on top of the first try —
+bounded, so a persistently broken sandbox/service/adapter doesn't retry
+forever. Deliberately a SEPARATE knob from `DEFAULT_MAX_ATTEMPTS`: that
+one retries a legitimate agent NOT_DONE and is opt-in (real spend, a real
+attempt at the task); this one retries infra flake automatically because
+retrying it can never be "unfair" to the agent — no attempt was actually
+graded. See `_EVALUATION_ERRORS` below for exactly what triggers it.
+"""
+
+_EVALUATION_ERRORS: tuple[type[Exception], ...] = (SandboxError, AdapterError, WorktreeError)
+"""Every exception that means "this attempt could not be evaluated at
+all" — sandbox provisioning failed, a declared service never became
+healthy, the install step hung, the adapter's own CLI crashed, worktree
+isolation itself failed. None of these are a legitimate agent NOT_DONE:
+a NOT_DONE is always a *returned* `Verdict` with a real PROVEN FAIL signal
+in it, never a raised exception — `Adapter.run`'s docstring makes this
+the adapter's contract too ("must not raise on the agent merely failing
+the task"). `_run_attempt` below is the ONE place this tuple is caught to
+build an ERROR `Verdict` and retry; nowhere else in this module treats a
+returned NOT_DONE `Verdict` as something to retry automatically — that
+loop (`run_with_retries`'s `max_attempts`) is a structurally different
+piece of code below, opt-in and per the caller's own retry budget.
+"""
 
 
 def _budget_deadline(sandbox_config: SandboxConfig) -> float | None:
@@ -288,26 +316,83 @@ def _apply_pricing_fallback(attempt: AttemptResult, config: VerdictConfig) -> At
     return attempt.model_copy(update={"cost_usd": computed})
 
 
+def _error_verdict(task: str, agent: str, repo: Path, exc: Exception) -> Verdict:
+    """An ERROR `Verdict` for an attempt that never got evaluated at all —
+    cost is genuinely 0 (nothing ran to spend anything), not unknown, and
+    `signals`/`attributions` stay empty; `error` is what makes
+    `Verdict.status` ERROR (see `schema.py`), never NOT_DONE.
+    """
+    return Verdict(
+        task=task,
+        agent=agent,
+        repo=str(repo),
+        attempt=AttemptResult(diff="", files_changed=[], cost_usd=0.0),
+        signals=[],
+        error=str(exc),
+    )
+
+
+def _run_attempt(
+    task: str,
+    repo: Path,
+    adapter: Adapter,
+    sandbox_config: SandboxConfig | None,
+    max_error_retries: int,
+) -> list[Verdict]:
+    """One logical attempt at `task`, with bounded automatic retry ONLY
+    for `_EVALUATION_ERRORS` — infra that raised instead of returning a
+    gradable `Verdict`. Structurally separate from `run_with_retries`'s
+    own loop below on purpose: this one triggers on a *raised exception*,
+    that one triggers on a *returned* `Verdict` that isn't DONE — so a
+    legitimate agent NOT_DONE (always a returned Verdict, never a raised
+    one) can never be mistaken for infra flake and retried here.
+
+    Returns every attempt actually made — 1 unless an `_EVALUATION_ERRORS`
+    was hit, in which case up to `max_error_retries + 1` — so
+    `TaskRun.attempts`/`total_cost_usd` still account for each one, the
+    same discipline already applied to agent retries.
+    """
+    verdicts: list[Verdict] = []
+    for _ in range(max(max_error_retries, 0) + 1):
+        try:
+            verdicts.append(run(task=task, repo=repo, adapter=adapter, sandbox_config=sandbox_config))
+            return verdicts
+        except _EVALUATION_ERRORS as exc:
+            verdicts.append(_error_verdict(task, adapter.name, repo, exc))
+    return verdicts
+
+
 def run_with_retries(
     task: str,
     repo: Path,
     adapter: Adapter,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     sandbox_config: SandboxConfig | None = None,
+    max_error_retries: int = DEFAULT_MAX_ERROR_RETRIES,
 ) -> TaskRun:
     """Attempt `task` up to `max_attempts` times, stopping early on the
     first DONE. Every attempt is kept — including failed, abandoned ones —
     so `TaskRun`'s cost accounting reflects what the task actually cost,
     not just what the winning attempt cost.
 
-    Defaults to a single attempt: retries are opt-in. Each retry re-runs
-    the real adapter, which for `ClaudeCodeAdapter` means real spend —
-    Verdict shouldn't silently multiply a bill the caller didn't ask for.
+    Defaults to a single agent attempt: `max_attempts` retries are opt-in.
+    Each retry re-runs the real adapter, which for `ClaudeCodeAdapter`
+    means real spend — Verdict shouldn't silently multiply a bill the
+    caller didn't ask for. `max_error_retries` is a SEPARATE, always-on
+    budget (see `DEFAULT_MAX_ERROR_RETRIES`) for infra that couldn't be
+    evaluated at all; it never multiplies agent spend the way an agent
+    retry does, since by construction the agent never got to run.
+
+    Stops early on ERROR too, not just DONE: once `_run_attempt` has
+    exhausted its own bounded infra retries and still couldn't evaluate
+    the attempt, handing the same broken sandbox back to the agent for
+    another `max_attempts` round won't fix it — it would just spend more
+    of the agent's budget for no evaluative benefit.
     """
     attempts: list[Verdict] = []
     for _ in range(max(max_attempts, 1)):
-        verdict = run(task=task, repo=repo, adapter=adapter, sandbox_config=sandbox_config)
-        attempts.append(verdict)
-        if verdict.done:
+        attempts.extend(_run_attempt(task, repo, adapter, sandbox_config, max_error_retries))
+        latest = attempts[-1]
+        if latest.done or latest.status is VerdictStatus.ERROR:
             break
     return TaskRun(task=task, agent=adapter.name, repo=str(repo), attempts=attempts)
