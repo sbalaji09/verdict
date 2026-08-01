@@ -2552,3 +2552,209 @@ still where the fuller shape of this gets designed.
   command, same as a single `verdict run` does.
 - **Folding ERROR into a fuller Phase 11 shape** — retry policy, a
   dedicated provenance bucket, richer reporting. See above.
+
+## Phase 11 — The Outcome Taxonomy: ERROR Gets a Retry Policy and a Voice
+
+## The problem, restated
+
+Phase 10 pulled `VerdictStatus.ERROR` forward deliberately minimally: one
+status value, one accounting rule (excluded from `pass_rate`'s
+denominator), and just enough renderer plumbing not to crash. Its own
+DESIGN.md section named exactly what it left undone — "no retry policy,
+no dedicated provenance bucket, no richer reporting" — and scoped that to
+this phase. The animating complaint behind doing it now: a leaderboard
+that can't tell "the agent failed" from "our own sandbox never came up"
+is lying about what it measures, and a run that could have succeeded on a
+second try but was never given one is wasted signal. Three things had to
+be true by the end of this phase: ERROR has to mean the same thing
+everywhere (sandbox failures, setup failures, adapter crashes, infra
+timeouts — not just the service-health/provisioning cases Phase 10
+covered), infra flake has to get a bounded second (and third) chance
+automatically, and a legitimate agent NOT_DONE must never get swept into
+that same automatic retry — those are different questions with different
+answers, and conflating them either wastes an agent's retry budget on
+infra Verdict can't fix, or lets Verdict quietly pretend a repeatable
+agent failure was just bad luck.
+
+## Widening what counts as ERROR: adapter crashes join sandbox failures
+
+Phase 10's catch site only ever saw `SandboxError` (provisioning, service
+health, setup/install). But `Adapter.run`'s own docstring already drew
+the line Verdict needed here, before this phase touched a line of code:
+"must not raise on the agent merely failing the task — only on the
+adapter itself being unable to run." A raised adapter exception was
+*already*, by contract, infra-not-agent — Phase 10 just didn't act on
+that fact yet, so an adapter CLI crashing (missing binary, malformed
+output, an unexpected non-zero exit) still propagated as a bare exception
+with no ERROR Verdict at all, in either the single-run or suite path.
+
+Phase 11 gives every adapter error class a shared ancestor —
+`verdict.adapters.AdapterError(RuntimeError)` — and every existing
+per-adapter class (`ClaudeCodeAdapterError`, `CursorAdapterError`,
+`CodexAdapterError`, `AiderAdapterError`, `OpenHandsAdapterError`) now
+subclasses it instead of `RuntimeError` directly. This isn't cosmetic:
+it's what lets `runner.py` catch "the adapter itself is broken" as one
+concept — `_EVALUATION_ERRORS = (SandboxError, AdapterError,
+WorktreeError)` — without hardcoding a per-adapter list that would need a
+new line added every time a sixth, seventh, ... agent adapter ships.
+`WorktreeError` joins the same tuple for the same reason: git worktree
+isolation failing is exactly as much "Verdict's own infra broke" as a
+sandbox never coming up, and was already excluded from ever becoming a
+gate Signal.
+
+## The retry policy: two structurally separate loops, not one generic one
+
+Before this phase, `run_with_retries`'s `max_attempts` loop was the only
+retry mechanism that existed, and it only ever "worked" for ERROR by
+accident: a `SandboxError` raised mid-loop simply propagated straight out
+of `run_with_retries` uncaught, aborting every remaining attempt, not
+retrying. Phase 11 replaces that with two loops that never share code:
+
+- **`_run_attempt`** (new, `runner.py`) — retries ONLY on a raised
+  `_EVALUATION_ERRORS` exception, up to `max_error_retries` extra times
+  (`DEFAULT_MAX_ERROR_RETRIES = 2`, a new constant independent of
+  `DEFAULT_MAX_ATTEMPTS`). It never inspects a returned `Verdict`'s
+  status at all — structurally, there is no code path in this function
+  that could see a NOT_DONE and decide to retry it, because NOT_DONE is
+  never raised, only returned. Exhausting the budget without success
+  builds a real `Verdict(error=str(exc))` via the same `_error_verdict`
+  helper `suite/runner.py` used to build inline before this phase (now
+  shared, not duplicated).
+- **`run_with_retries`'s own loop** (existing, changed) — retries ONLY a
+  returned `Verdict` that isn't `done`, up to `max_attempts` times,
+  exactly as before. The one behavior change: it now also stops early on
+  `VerdictStatus.ERROR`, not just DONE — once `_run_attempt` has already
+  exhausted its own bounded infra-retry budget, handing the same broken
+  sandbox back to the agent for another full `max_attempts` round buys
+  nothing and would just spend more of the agent's budget (real spend,
+  for a real adapter) against something already proven broken.
+
+Both loops append every attempt they make to the same flat
+`TaskRun.attempts` list — an ERROR retry is exactly as real an "attempt"
+for cost-accounting purposes as an agent retry is, so `total_cost_usd`
+already accounts for it correctly with no schema change needed
+(`_error_verdict`'s `cost_usd=0.0` is real: by construction, nothing in
+`_EVALUATION_ERRORS` fires after the agent has spent anything — every one
+of them is either pre-adapter setup or the adapter's own "I never ran"
+signal).
+
+**The one behavior change this forces at the `run()` level**: `run()`
+itself is UNCHANGED — it still lets `_EVALUATION_ERRORS`-family exceptions
+propagate all the way out uncaught, exactly as `test_timeouts.py`'s
+`test_provisioning_timeout_raises_and_never_produces_a_signal` continues
+to prove. Only `run_with_retries` (and therefore `verdict run`, `verdict
+bench` via `run_suite`) catches and retries now. `grade_existing_diff`
+(`verdict gate`, the merge-gate command) is deliberately untouched this
+phase — see "out of scope" below.
+
+## `suite/runner.py`: the catch site moves down a layer
+
+Phase 10's `run_suite`/`_run_task` had its own inline `except
+SandboxError` block, building an ERROR `Verdict` by hand, because
+`run_with_retries` didn't handle it. That block is gone: `run_with_retries`
+now never lets `_EVALUATION_ERRORS` escape, so `_run_task` is back to a
+one-expression wrapper. `run_suite` gained one new parameter,
+`max_error_retries` (threaded straight to `run_with_retries`, default
+`DEFAULT_MAX_ERROR_RETRIES`) — every `(config, task)` pair gets its own
+independent bounded infra-retry budget, same as before, just resolved one
+call frame lower than it used to be.
+
+## Economics: audited, not rewritten
+
+`ConfigResult.pass_rate`/`pass_rate_per_dollar` already excluded errored
+tasks from their denominators as of Phase 10 — this phase's job was to
+audit every OTHER metric path for the same discipline, not re-derive it:
+
+- `failure_modes.py::summarize_failure_modes` — already correct by
+  construction: an ERROR `Verdict` has `signals=[]`, so it contributes
+  zero entries to the failing-check tally without needing a status check
+  at all.
+- `economics.py`/`report_html.py`'s leaderboards — correct in the number
+  (`pass_rate` was already right), but the *display* wasn't: showing
+  `tasks_done/tasks_total` next to a percentage computed over
+  `tasks_total - tasks_errored` was internally inconsistent (a reader
+  could compute the shown fraction and get a different percentage than
+  the one printed next to it). Both now show `tasks_done/<graded>` where
+  `<graded> = tasks_total - tasks_errored`, plus a new dedicated
+  `errored` column (`N/tasks_total`, or `—` when zero) — the leaderboard
+  now states the exclusion instead of leaving a reader to infer it from a
+  percentage that doesn't match the fraction beside it.
+- `flakiness.py`'s Wilson-interval `pass_rate` — audited and left alone
+  on purpose: `run_flakiness` calls `run()` directly (not
+  `run_with_retries`), so it was never in scope for this phase's ERROR
+  handling to begin with (Phase 10 already noted this as deferred; still
+  deferred, see "out of scope" below), and its `pass_rate` isn't the
+  metric this phase's economics language ("pass-rate-per-dollar
+  denominators") refers to regardless.
+- `calibration.py` — never consults `Verdict.status`, nothing to audit.
+
+## Renderers: CLI and HTML get the same `errored` column, JSON already had it
+
+`report.py` (CLI) already rendered ERROR distinctly as of Phase 10 (bold
+magenta `VERDICT: ERROR`, the `error` message shown inline) — unchanged
+this phase. `report_json.py` needed no change either: `ConfigResult`'s
+`tasks_errored` computed field and every `Verdict.status`/`error` field
+already round-trip through `model_dump(mode="json")` with no reshaping,
+so a consumer parsing the JSON report could already tell ERROR apart from
+NOT_DONE before this phase touched anything. The actual gaps were in the
+two *aggregate* renderers:
+
+- `economics.py`'s CLI leaderboard table and `report_html.py`'s HTML
+  leaderboard table both gained the `errored` column described above.
+- The HTML report's "show only failing tasks" checkbox previously kept
+  only `.fail`-classed tasks, silently hiding `.error`-classed ones (a
+  reader who ticked the box to see what needed attention would have
+  ERROR tasks disappear along with the DONE ones) — inverted to hide only
+  `.pass`, so both FAIL and ERROR stay visible under the filter, which is
+  what a reader ticking that box actually wants to see.
+
+## Tests
+
+`tests/test_error_retry.py` (new) proves the retry-policy split directly:
+an adapter that raises on every call is retried exactly
+`max_error_retries` times before landing on ERROR; one that raises twice
+then succeeds recovers within the budget; a `max_error_retries=0` run
+makes exactly one attempt; an ERROR that exhausts its infra-retry budget
+stops the outer `max_attempts` loop early even when attempts remain; a
+legitimate NOT_DONE from `_AlwaysFailsAdapter` is never touched by the
+error-retry path regardless of how generous `max_error_retries` is, and
+is bounded by `max_attempts` exactly as before; an `AdapterError` raise is
+routed through the same ERROR path as a `SandboxError`; and two
+`run_suite`-level tests prove the same bounded-retry-then-ERROR behavior
+end-to-end, including a mixed suite where one task errors and is excluded
+from `pass_rate`'s denominator while a sibling task's real pass is
+unaffected. `tests/test_error_routing.py`'s Phase 10 tests are unchanged
+in substance; its module docstring and `tests/test_timeouts.py`'s
+provisioning-timeout test docstring were updated to describe the new
+`run()` vs. `run_with_retries` split rather than claim (as Phase 10
+correctly did, at the time) that both behave identically.
+
+## What's explicitly out of scope for Phase 11
+
+- **`grade_existing_diff`/`verdict gate`** — still lets
+  `_EVALUATION_ERRORS`-family exceptions propagate to `cli.py`'s
+  `_RUN_ERRORS` (`WorktreeError` only was actually caught there before;
+  `SandboxError` from `grade_existing_diff`'s own service/sandbox setup
+  was already an uncaught crash pre-Phase-11 and remains one). The
+  merge-gate command grades a PR's diff in place, not via an `Adapter` —
+  there's no agent-retry concept for it to slot next to, and giving it
+  its own bounded infra-retry-then-ERROR treatment is real, valuable, and
+  deliberately deferred rather than bolted on asymmetrically with the
+  agent-driven commands in the same pass.
+- **`verdict flaky`** — same Phase 10 deferral, still true: `run_flakiness`
+  calls `run()` directly, so a `SandboxError` mid-trial still crashes the
+  whole command. `--trials` runs measuring agent flakiness and this
+  phase's infra-flake retry are two different kinds of "flaky" that
+  happen to share a word; conflating them into one code path wasn't
+  attempted.
+- **A dedicated provenance bucket for ERROR** — `Verdict.status` still
+  derives from `_proven_applicable()`/`budget_exceeded`/`error` exactly
+  as Phase 10 left it; ERROR still short-circuits ahead of all of that
+  rather than participating in the PROVEN/JUDGED signal model. Real
+  future work (e.g. "which specific gate was mid-flight when the sandbox
+  died") stays deferred.
+- **Cross-run retry memory** — each `verdict bench`/`verdict run`
+  invocation's error-retry budget is independent; there's no persistent
+  "this repo's sandbox has failed N times across the last M runs, stop
+  trying" circuit breaker. A human (or a wrapper script) still decides
+  when a suite's infra is unfixably broken.
