@@ -24,6 +24,8 @@ from verdict.attribution.bisect import run_bisect
 from verdict.attribution.depgraph import build_dependency_graph, find_dependency_depth
 from verdict.attribution.reproduce import Reproduction, check_reproduces
 from verdict.attribution.synth import build_synthetic_ladder
+from verdict.sandbox import SandboxConfig
+from verdict.sandbox.config import create_sandbox
 from verdict.schema import (
     Attribution,
     AttributionKind,
@@ -48,12 +50,17 @@ MAX_ATTRIBUTIONS_PER_GATE = 5
 
 
 def attribute_failures(
-    repo: Path, worktree: Worktree, final_commit: str, signals: list[Signal]
+    repo: Path,
+    worktree: Worktree,
+    final_commit: str,
+    signals: list[Signal],
+    sandbox_config: SandboxConfig | None = None,
 ) -> list[Attribution]:
     """`final_commit` must be a commit capturing exactly what the agent
     changed — captured by the caller *before* any gate ran, so gate
     byproducts (e.g. `__pycache__`) never get mistaken for agent edits.
     """
+    sandbox_config = sandbox_config or SandboxConfig()
     attributions: list[Attribution] = []
     for signal in signals:
         if signal.provenance is not Provenance.PROVEN or signal.status is not GateStatus.FAIL:
@@ -62,13 +69,17 @@ def attribute_failures(
             list(signal.failures) if signal.failures else [None]
         )
         for target in targets[:MAX_ATTRIBUTIONS_PER_GATE]:
-            attributions.append(_attribute_one(repo, worktree, final_commit, signal.name, target))
+            attributions.append(
+                _attribute_one(repo, worktree, final_commit, signal.name, target, sandbox_config)
+            )
     return attributions
 
 
-def _reproduces_at(repo: Path, ref: str, gate: str, identity: str | None) -> Reproduction:
-    with scratch_worktree(repo, ref) as wt:
-        return check_reproduces(gate, identity, wt)
+def _reproduces_at(
+    repo: Path, ref: str, gate: str, identity: str | None, sandbox_config: SandboxConfig
+) -> Reproduction:
+    with scratch_worktree(repo, ref) as wt, create_sandbox(wt, sandbox_config) as sandbox:
+        return check_reproduces(gate, identity, wt, sandbox=sandbox)
 
 
 def _location(target: FailureLocation | None) -> str | None:
@@ -80,13 +91,18 @@ def _location(target: FailureLocation | None) -> str | None:
 
 
 def _attribute_one(
-    repo: Path, worktree: Worktree, final_commit: str, gate: str, target: FailureLocation | None
+    repo: Path,
+    worktree: Worktree,
+    final_commit: str,
+    gate: str,
+    target: FailureLocation | None,
+    sandbox_config: SandboxConfig,
 ) -> Attribution:
     identity = target.identity if target else None
     failure_id = identity or gate
     failure_location = _location(target)
 
-    if _reproduces_at(repo, worktree.base_commit, gate, identity) is Reproduction.BAD:
+    if _reproduces_at(repo, worktree.base_commit, gate, identity, sandbox_config) is Reproduction.BAD:
         return Attribution(
             kind=AttributionKind.PRE_EXISTING,
             check_name=gate,
@@ -105,7 +121,9 @@ def _attribute_one(
         culprit_commit = commits[0] if commits else final_commit
         method = "single change (no intermediate commits to bisect)"
     else:
-        bisected_commit = run_bisect(repo, worktree.base_commit, final_commit, gate, identity)
+        bisected_commit = run_bisect(
+            repo, worktree.base_commit, final_commit, gate, identity, sandbox_config
+        )
         if bisected_commit is None:
             return _inconclusive(gate, failure_id, failure_location, "bisect(commit)")
         culprit_commit = bisected_commit
@@ -121,7 +139,7 @@ def _attribute_one(
         culprit_file = files[0]
     else:
         with build_synthetic_ladder(repo, parent, culprit_commit, files) as (bad_sha, sha_to_file):
-            file_culprit_commit = run_bisect(repo, parent, bad_sha, gate, identity)
+            file_culprit_commit = run_bisect(repo, parent, bad_sha, gate, identity, sandbox_config)
             culprit_file = sha_to_file.get(file_culprit_commit) if file_culprit_commit else None
         if culprit_file is None:
             return _inconclusive(gate, failure_id, failure_location, "bisect(file)")

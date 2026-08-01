@@ -17,6 +17,7 @@ from pathlib import Path
 
 from verdict.config import load_config
 from verdict.gates.registry import resolve_gate
+from verdict.sandbox import Sandbox
 from verdict.schema import GateStatus
 
 
@@ -26,14 +27,16 @@ class Reproduction(str, Enum):
     SKIP = "skip"   # untestable state — don't let bisection draw a conclusion
 
 
-def check_reproduces(gate: str, target_identity: str | None, worktree: Path) -> Reproduction:
+def check_reproduces(
+    gate: str, target_identity: str | None, worktree: Path, sandbox: Sandbox | None = None
+) -> Reproduction:
     """`target_identity` is a `FailureLocation.identity`, or None to check
     the gate as a whole (used for `build`, and for any gate whose original
     failure came from a `verdict.yml` override with no structured detail).
     """
     try:
         config = load_config(worktree)
-        signal = resolve_gate(gate, worktree, config)
+        signal = resolve_gate(gate, worktree, config, sandbox=sandbox)
     except Exception:
         # Anything we didn't anticipate (permissions, a tool crashing in a
         # way exec_command's own guards don't cover) — treat as untestable
