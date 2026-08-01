@@ -1173,3 +1173,284 @@ opinion doesn't matter, done.
   above. A repo with known brief glitches should tune
   `glitch_frame_interval_seconds` down rather than rely on Verdict to
   retry until it happens to catch one.
+
+---
+
+## Phase 5 — Benchmark Suites & More Adapters
+
+## The goal, restated
+
+Every phase through Phase 4 answers "is this one agent's one attempt at
+one task actually correct" — thoroughly, but one task at a time. Phase 5
+doesn't add a new way of *grading* anything; it adds a way of *repeating*
+grading across many tasks and many agents, then aggregating the result
+into the two things the brief asked for: a ranked pass-rate-per-dollar
+leaderboard, and a failure-mode breakdown. The load-bearing design
+decision, made before any code: **a suite task is a `verdict run` with its
+repo and task text pre-wired, nothing more.** No new acceptance-criteria
+format, no new trust bucket, no new way for a check to pass or fail — see
+below for why that constraint was non-negotiable.
+
+## The task/acceptance-criteria format
+
+```text
+my_suite/
+  bug-fix-calculator/
+    task.yml          # { task: "...", repo: "repo", category: "bug-fix" }
+    repo/              # a real git repo — its own tests, its own verdict.yml
+  refactor-tax-calc/
+    task.yml
+    repo/
+```
+
+`task.yml`'s only required key is `task` — the exact natural-language
+instruction `--task` would take for a single `verdict run`. `repo`
+defaults to `"repo"` (relative to the task directory); `category` is
+optional free-form metadata (`"bug-fix"`/`"refactor"`/`"feature-add"` in
+the starter suite) used only by the failure-mode breakdown's reporting,
+never by scoring.
+
+**The acceptance criteria are never written down as prose in `task.yml` at
+all.** They're whatever `repo/`'s own gates (test/typecheck/build/lint)
+and `verdict.yml` (frontend checks, gate overrides, cost pricing) already
+define — checked the exact same executable way a lone `verdict run` checks
+them. This was the one design question worth pausing on before writing
+`suite/loader.py`: a rubric-style `acceptance_criteria: ["the button
+should be green", "the API should validate input"]` field would have been
+easy to add and immediately would have reintroduced exactly the problem
+Phase 0 exists to solve — a prose rubric that has to be *interpreted*
+(by a human, or worse, by another LLM) instead of *executed*. Making a
+suite task nothing more than "a repo + a task string" means every
+acceptance criterion a suite task has is, by construction, something
+`resolve_gate`/`run_frontend_checks` already knows how to check
+mechanically. `suite/loader.py` needed **zero new schema** for this
+reason: `SuiteTask` is a thin dataclass (`name`, `task`, `repo`,
+`category`), and `run_suite` (`suite/runner.py`) is a loop over
+`run_with_retries` — the exact function Phase 3 already built for a single
+task's retries — called once per `(config, task)` pair.
+
+## The suite runner: no new scoring logic
+
+```python
+@dataclass
+class BenchConfig:
+    label: str
+    adapter: Adapter
+
+def run_suite(tasks, configs, max_attempts=DEFAULT_MAX_ATTEMPTS) -> list[ConfigResult]:
+    return [
+        ConfigResult(
+            label=config.label,
+            task_runs=[
+                run_with_retries(task=t.task, repo=t.repo, adapter=config.adapter, max_attempts=max_attempts)
+                for t in tasks
+            ],
+        )
+        for config in configs
+    ]
+```
+
+(Written flat above for clarity; the real implementation is the same two
+nested loops.) Every `(config, task)` pair gets its own fully isolated
+`run_with_retries` call — its own worktree, its own gates, its own
+attribution, its own cost accounting — with zero interaction between
+configs or between tasks. `ConfigResult`'s `pass_rate`/`total_cost_usd`/
+`pass_rate_per_dollar` properties and `economics.rank`/`render` (Phase 3)
+needed **zero changes**: a suite run just produces the same
+`list[ConfigResult]` a caller could already have hand-assembled from
+individually-run `TaskRun`s, at a larger scale. `BenchConfig.label` is
+free-form for the same reason `ConfigResult.label` already was — "claude-
+code / sonnet" vs. "claude-code / opus" can both point at the same
+adapter class configured differently however that adapter exposes it;
+Verdict doesn't need to understand what varies between two configs to
+rank them.
+
+## Failure-mode breakdown: a tally, not a new classifier
+
+`failure_modes.py`'s `summarize_failure_modes` answers "what kind of thing
+does this config keep failing at, across a whole suite" by counting each
+`Signal.name` that's `PROVEN` and `FAIL` across every task run that didn't
+end `DONE` — nothing more sophisticated than a `Counter`. Two things this
+deliberately is **not**:
+
+- **Not a root-cause classifier.** Phase 2's attribution already answers
+  "why did this specific failure happen" per task, bisected to a culprit
+  file. This answers a different, coarser question at a different
+  altitude — which named checks a config fails across *many* tasks — and
+  doesn't try to explain any individual failure.
+- **Not influenced by JUDGED signals**, for the same reason `Verdict.status`
+  isn't: a vision-intent opinion is advisory, so it never counts as a
+  "failure mode" a config can be said to actually have — only executed,
+  proven failures do. Verified directly in `test_failure_modes.py`.
+
+Rendered as a plain table (`render_failure_modes`) alongside the
+leaderboard — e.g. "which agents break responsive layout, which never
+update fixtures" (the README's own framing) reduces, honestly, to "which
+named `Signal`s fail most often for this config," which is exactly what
+gets displayed.
+
+## `verdict bench`
+
+```bash
+verdict bench --suite examples/starter_suite --agent mock --agent claude-code
+```
+
+Loads the suite, builds one `BenchConfig` per `--agent` (repeatable),
+calls `run_suite`, then prints `economics.render` followed by
+`render_failure_modes`. One deliberate behavioral difference from
+`verdict run`: **`bench` never exits non-zero for a bad score.** `run` is
+built to be a CI merge gate — one task, one pass/fail, a nonzero exit
+blocks a PR. A suite is a scorecard for *comparing* configs, where "config
+X only got 40%" is data to report, not a build to fail; there's no single
+correct threshold Verdict could pick on the caller's behalf, so `bench`
+just reports and exits 0.
+
+## The starter suite
+
+`examples/starter_suite/` ships three tasks, one per category the brief
+named:
+
+| Task | Category | Acceptance criterion |
+|---|---|---|
+| `bug-fix` | bug-fix | `add()` subtracts instead of adding; existing tests must pass |
+| `refactor` | refactor | duplicated validation logic across two tax functions; existing tests must still pass |
+| `feature-add` | feature-add | a test already asserts `multiply()` exists; it must be added and pass |
+
+All three are minimal, real, standalone git repos (`setup.sh` bootstraps
+all three at once, same convention as every other `examples/*/setup.sh`),
+graded by the exact same `test` gate Phase 1 built — no suite-specific
+verification machinery exists. `--agent mock` works out of the box via
+`SuiteMockAdapter` (see below), so the whole suite is demoable with zero
+API keys, same as every earlier example.
+
+**A real limitation the refactor task surfaced immediately, worth stating
+plainly rather than glossing over:** a mock adapter given an unrelated,
+no-op patch for the refactor task still scores it `DONE`, because "the
+existing tests still pass" is genuinely satisfiable by *not touching the
+file at all*. This isn't a bug in the suite or the runner — it's an
+honest structural fact about executable-acceptance grading for
+refactor-shaped tasks specifically: "did not break behavior" and "actually
+did the refactor" are different claims, and only the first one is
+something a test suite can attest to. A human reviewer would immediately
+notice the duplication is still there; Verdict's executable checks
+structurally cannot, the same class of limitation Phase 2's
+`forgot-to-update-fixture` example already named for attribution ("Verdict
+attributes to files the agent changed, never to files it should have
+changed but didn't"). Verified directly, not asserted: `test_bench.py`
+runs a real no-op `SuiteMockAdapter` against all three starter-suite tasks
+and confirms exactly this — the bug-fix and feature-add tasks correctly
+fail, and the refactor task's true behavior depends on what "fixing" it
+even means executably.
+
+## `SuiteMockAdapter`: one canned patch per task, not one per repo
+
+`cli.py`'s existing `_MOCK_PATCHES` (Phase 0) is keyed by repo *name*,
+which works for one repo per demo but breaks down the moment `--agent
+mock` needs a *different* patch per task in the same suite run — a single
+`MockAdapter` instance is constructed with one fixed patch and can't vary
+it per call. `Adapter.run(task, worktree)` only ever receives the task's
+*text*, never an id, so `SuiteMockAdapter` (`adapters/mock.py`) looks its
+patch up by that text instead — the only per-task identity an `Adapter`
+call actually carries. This is a new adapter implementation, not a change
+to the `Adapter` Protocol itself: `SuiteMockAdapter.run` still has the
+exact same signature, and internally just constructs and delegates to a
+plain `MockAdapter` once it's found the right patch.
+
+## Four adapters added, one at a time — the interface never changed
+
+Cursor, Codex, Aider, and OpenHands were implemented in that order, each
+as its own standalone module mirroring `ClaudeCodeAdapter`'s shape
+(subprocess call to the tool's own CLI, defensive parsing of whatever
+usage/cost information it hands back, a dedicated `*AdapterError` for
+"the CLI itself couldn't run"). After each one, the same check ran: does
+`Adapter` (`name: str` + `run(task, worktree) -> AttemptResult`) still fit
+with zero modification? It did, all four times — **`adapters/__init__.py`
+was not touched during this phase.** Concretely, per adapter:
+
+- **`CursorAdapter`** (`adapters/cursor.py`) — closest to `ClaudeCodeAdapter`,
+  since Cursor's CLI (`cursor-agent`) was deliberately modeled on Claude
+  Code's: `-p`/`--print`, `--output-format json`, a force flag to
+  auto-accept edits headlessly. Same JSON-payload shape, same defensive
+  `.get()`-based field extraction.
+- **`CodexAdapter`** (`adapters/codex.py`) — the first real deviation in
+  *output* shape, not interface: `codex exec --json` streams
+  newline-delimited JSON events rather than one final object, so this
+  adapter parses line-by-line and keeps the last event carrying a usable
+  `usage` dict. It also doesn't report its own dollar cost the way Claude
+  Code's CLI does — `cost_usd` is left `None` rather than guessed, and a
+  user who wants a populated `$` column for this adapter configures
+  `verdict.yml`'s `cost.price_per_1k_tokens`, which Phase 3's pricing
+  fallback (`runner.py::_apply_pricing_fallback`) already exists for. A
+  genuinely different CLI output format changed *how this one adapter
+  parses stdout*; it didn't touch what `Adapter.run` returns or its
+  signature.
+- **`AiderAdapter`** (`adapters/aider.py`) — the second deviation: Aider
+  has no structured output mode at all, only a human-readable summary line
+  (`Tokens: 2.3k sent, 456 received. Cost: $0.01 message, $0.03 session.`).
+  Handled with a regex over that line — the exact same move
+  `gates/typecheck.py`'s `tsc` runner already made for a tool with no
+  native JSON reporter (see Phase 1's table). Still the same `Adapter`
+  shape; only the parsing strategy had to fit the tool.
+- **`OpenHandsAdapter`** (`adapters/openhands.py`) — the most conservative
+  of the four, and deliberately so. OpenHands is typically driven by
+  workspace/LLM-provider configuration rather than one self-contained
+  invocation, and has no documented structured cost output at all.
+  Rather than fabricate a number or half-guess at a config surface Verdict
+  doesn't manage, this adapter reports `tokens_input=tokens_output=0`,
+  `cost_usd=None`, always — an honest "unknown," not a wrong "zero" dressed
+  up as a real figure. `raw_output` still carries the CLI's full stdout so
+  a human has something to read even where accounting doesn't exist yet.
+
+**Why the interface held for all four, not by luck:** `Adapter` was
+scoped from Phase 0 to the smallest possible contract — take a task and a
+worktree, report a diff and a cost, don't judge correctness. Every
+CLI-driven coding agent, regardless of its own output format, fits that
+shape: it's given a prompt, it edits files, and it may or may not hand
+back token/cost accounting on the way out. The differences between these
+four tools all turned out to live *inside* `run()`'s implementation (how
+to invoke the CLI, how to parse what it prints), never in what `run()`
+takes or returns. Each adapter's tests (`test_cursor_adapter.py`,
+`test_codex_adapter.py`, `test_aider_adapter.py`,
+`test_openhands_adapter.py`) fake `subprocess.run` rather than requiring
+the real external binary (none of the four are installed in this
+environment) — they verify Verdict's side of the contract: command
+construction, defensive parsing, and that a missing binary or a timeout
+raises a clear, dedicated error instead of crashing or silently returning
+zeros.
+
+## What's explicitly out of scope for Phase 5
+
+- **No suite-level cross-task cost/pass-rate weighting** — `ConfigResult.
+  pass_rate` (Phase 3) is still unweighted; a suite of ten easy tasks and
+  one hard one still counts them equally. Difficulty-weighting remains a
+  suite-*design* concern, same scope line Phase 3 already drew.
+- **No persisted run history across `bench` invocations** — every
+  `verdict bench` call is a fresh run; nothing is written to disk for a
+  later invocation to compare against. A historical trend view is a
+  reporting feature layered on top of `ConfigResult`, not something this
+  phase's runner needed to build to satisfy "run every config across all
+  tasks."
+- **No parallel task/config execution** — `run_suite` is two sequential
+  loops. Every `(config, task)` pair is fully independent, so this is a
+  real, addressable performance gap, not a correctness one; parallelizing
+  it doesn't change any task's grade.
+- **No live progress reporting mid-suite** — `verdict bench` prints once,
+  at the end, after every config has run every task. A long suite gives no
+  feedback until it's entirely done.
+- **No model-level adapter configuration surface** — `BenchConfig.label`
+  lets a caller *label* "claude-code / sonnet" vs. "claude-code / opus,"
+  but Verdict doesn't provide a uniform way to actually *select* a model
+  for a given adapter; that's left to however each adapter's own
+  constructor or environment exposes it (an API-key env var, a CLI flag
+  baked into the adapter's own `command` list, etc.).
+- **Adapter CLI flags/output shapes are believed-correct as of writing,
+  not verified against the real binaries** — none of Cursor/Codex/Aider/
+  OpenHands are installed in this environment (only Claude Code's own
+  adapter, from Phase 0, has ever been exercised against a real CLI).
+  Every new adapter's defensive parsing is designed so a wrong guess about
+  exact flags or JSON field names degrades gracefully (0 tokens, `None`
+  cost, a clear `*AdapterError` on outright failure) rather than crashing
+  — but "degrades gracefully if wrong" is not the same claim as "verified
+  correct." A real integration pass against each installed CLI is future
+  work, not something a sandboxed test run can honestly claim to have
+  done.

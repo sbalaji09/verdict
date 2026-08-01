@@ -175,6 +175,12 @@ report:
 
 Point Verdict at a folder of tasks to turn it from a one-shot checker into a scorecard. Each task is a real change with executable acceptance criteria; Verdict runs every agent/model/config against all of them and produces a ranked, `pass-rate-per-dollar` leaderboard plus a failure-mode breakdown (which agents hallucinate APIs, which break responsive layout, which never update fixtures). Ships with a starter suite of bug-fix, refactor, and feature-add tasks; add your own by dropping a folder in.
 
+```bash
+verdict bench --suite examples/starter_suite --agent mock --agent claude-code
+```
+
+A suite task is just a `verdict run` with its repo and task text pre-wired — see `examples/starter_suite/*/task.yml` for the format, and DESIGN.md's Phase 5 section for why acceptance criteria are never written as prose.
+
 ## Roadmap
 
 - [x] Executable grounding: test / typecheck / build / lint in isolated worktrees
