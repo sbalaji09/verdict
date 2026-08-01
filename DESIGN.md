@@ -2316,3 +2316,239 @@ rather than left implicit:
   adapter itself gets at most N minutes of the 30" sub-allocation; the
   budget is one shared pool, first-come-first-served across phases in
   execution order.
+
+## Phase 10 — Setup, Services, and a Base-State Cache
+
+## The problem, restated
+
+Phase 8's sandbox and Phase 9's timeouts made execution safe and bounded;
+neither made it *correct* for anything beyond a repo that already has its
+dependencies vendored and needs nothing else to boot. `sandbox/install.py`
+shipped in Phase 8 as an explicitly minimal placeholder — its own
+docstring listed exactly what it deferred: *"broader/more accurate
+autodetection, dependency caching across runs, resolving a repo's pinned
+language version..., and service dependencies (databases, etc.)."* Phase
+10 is that list, plus one efficiency problem the codebase had been living
+with since Phase 2: `attribution/engine.py`'s baseline check and
+`frontend/runner.py`'s before-image each independently re-rendered the
+exact same pre-agent `base_commit` from scratch, every single time either
+was needed — up to `MAX_ATTRIBUTIONS_PER_GATE` (5) times per gate, per
+attempt, for the baseline check alone.
+
+Four decisions were made explicitly, before writing any of this phase's
+code, and are recorded here rather than left implicit in the diff:
+
+## Service dependencies: an allowlist, not an arbitrary image
+
+`verdict.yml`'s new `services:` section (parsed by `config.py`'s
+`ServiceSpec`) never lets the repo being graded name a raw `image:` for
+Verdict to `docker run` — it names a `type` (`postgres`, `redis`, `mysql`,
+`mongodb`) and a `version`, looked up against `sandbox/services.py`'s own
+`_SERVICE_IMAGES` allowlist, which Verdict's code owns entirely. An
+unrecognized type or version is a real, surfaced `SetupError` — never a
+silent fallback to some default image, and never something `verdict.yml`
+can talk its way around by editing itself. Extending the allowlist (a new
+service type, a newer pinned version, a genuinely custom image for some
+future use case) is an operator action against Verdict's own code, the
+same "sandbox policy never comes from the repo" rule Phase 8 established
+for everything else in this module family. `env`/`port` on a `ServiceSpec`
+are still repo-controlled — but their blast radius is bounded to
+configuring a fresh, ephemeral, Verdict-launched container (a Postgres
+password, a port number), not to choosing what code runs.
+
+## Networking: a per-attempt `--internal` Docker network
+
+Gates need to reach a declared service (a test suite hitting Postgres)
+without gaining the general internet egress Phase 8/9 close by default —
+previously a binary choice (`--network none` or `bridge`) with nothing in
+between, and explicitly flagged as a gap in Phase 9's "out of scope" list.
+Phase 10 closes it with `docker network create --internal
+verdict-attempt-<id>` (`sandbox/docker.py`): Docker itself refuses to
+route this network to the public internet, full stop, so joining it is
+safe in a way a generic allowlist would need more machinery to guarantee.
+Each declared service joins with `--network-alias <name>` (the DNS name
+`verdict.yml` gave it); the gate/adapter container joins the same network
+*only when any services are declared* — the common, service-free case is
+completely unchanged, still `--network none`. `sandbox/services.py`'s
+`start_services` tears down whatever it already started on the first
+failure (an unrecognized type/version, a service that never passes its
+health check), and `runner.py` tears down the network itself in a
+`finally` around the whole attempt — plus `sandbox/docker.py::
+sweep_leaked_networks`, run once at the start of a batch of work, cleans
+up `verdict-attempt-*` networks a previous crashed process never got to
+remove (best-effort: `docker network rm` already refuses to remove a
+network still attached to a live container, so this only ever reaches
+genuine orphans). `tests/test_sandbox_services_docker.py` (Docker-gated)
+proves both halves for real: a fixture repo whose test suite needs
+Postgres actually passes end to end, and a gate container joined to the
+service network still cannot reach the public internet.
+
+Gates block on every declared service's health check (a per-type command
+— `pg_isready`, `redis-cli ping`, ...) before running at all. A service
+that never becomes healthy is `SetupError`, never a gate FAIL — the same
+agent-fault/infra-fault line Phase 9 drew for provisioning timeouts, now
+applied to "the database never came up."
+
+## Version pins and a broader, lockfile-aware install
+
+`sandbox/versions.py` reads `.python-version`/`.nvmrc` if present and
+resolves them against pyenv/nvm — both already baked into the image since
+Phase 8, unused until now. pyenv's shims stay on `PATH` inside the image,
+so resolving a Python pin is just `PYENV_VERSION=<pin>` in the env overlay
+(installing the version first via `pyenv install --skip-existing` if it's
+not already present). nvm has no persistent shim directory on this image's
+`PATH` (the Dockerfile hardcodes `PATH` to one baked-in Node version), so
+resolving a Node pin means sourcing `nvm.sh` once during setup, installing
+if needed, and resolving the concrete `node` binary's directory to prepend
+onto `PATH` for everything after — nvm itself is never invoked again past
+that point. The resulting overlay (`sandbox/install.py::run_setup_step`'s
+return value) is merged into every subsequent gate's own execution env
+(`gates/base.py`/`registry.py`'s new `env` parameter, threaded the same
+mechanical way Phase 9 threaded `timeout_seconds`) — the pinned version is
+what actually runs the gates, not just what a resolution step confirmed
+was available. Deliberately NOT resolved: anything short of a literal
+pinned-version file (`pyproject.toml`'s `requires-python`, `package.json`'s
+`engines.node`, a version *range* rather than a single pin) — see "out of
+scope" below.
+
+Install detection (`_detect_install_command`) is now lockfile-aware:
+`package-lock.json` → `npm ci`, `pnpm-lock.yaml` → `pnpm install
+--frozen-lockfile`, `yarn.lock` → `yarn install --frozen-lockfile`,
+`poetry.lock` → `poetry install`, `uv.lock` → `uv sync --frozen`, falling
+back to a loose `npm install`/`pip install -r requirements.txt` only when
+no lockfile is present. A lockfile-respecting install is preferred
+wherever a lockfile exists on purpose: a repo that committed one is asking
+for exactly what it locked, and `--frozen`/`ci` fail loudly on a
+lockfile/manifest mismatch rather than silently resolving something
+adjacent to it.
+
+Version-pin resolution and dependency install both run inside the SAME
+network-on sandbox session (`run_setup_step`), before gates' own
+network-off session opens — unchanged from Phase 8's separation, just with
+more work happening in that one networked step.
+
+## The base-state cache
+
+Keyed on `(base_commit_sha, lockfile_hash, sandbox_image_tag)` —
+`sandbox/cache.py::cache_key`. `lockfile_hash` is computed via `git show
+{ref}:{lockfile}` for every lockfile name this module knows about, so
+computing it needs no worktree checkout at all. The image tag is part of
+the key deliberately: a different `verdict-sandbox` image can carry
+different tool versions and produce genuinely different real results, so
+leaving it out of the key would let a stale cache entry silently survive
+an image upgrade.
+
+Two independent artifact kinds live under one cache entry
+(`~/.cache/verdict/base-state/<key>/`, overridable via `VERDICT_CACHE_DIR`
+— no eviction/TTL this phase, entries simply accumulate, noted as
+deferred below rather than silently unbounded-and-unmentioned):
+
+- **`gate_signals.json`** — all four gates' PROVEN signals at
+  `base_commit`, computed together on the first miss (not just the one
+  gate that happened to trigger it) so the *next* failing signal's
+  baseline check, whatever gate it's against, hits the cache too.
+  `attribution/engine.py::_reproduces_at` consults this before rendering
+  anything; `attribution/reproduce.py::reproduction_from_signal` was
+  split out of `check_reproduces` specifically so the cache-hit path can
+  reuse the exact same signal-to-Reproduction logic against a *cached*
+  Signal, not just a freshly-resolved one.
+- **`screenshots/<viewport>.png`** — the before-image
+  `frontend/runner.py::_capture_before` renders once per unique
+  `base_commit`/lockfile/image combination instead of once per
+  `run_frontend_checks` call (previously: once per attempt, even across
+  `run_with_retries` attempts that share the same `base_commit`).
+
+A cache MISS still does real, full work — render a scratch worktree,
+install dependencies (`run_setup_step`, so a cache population correctly
+reflects a repo *with* its deps installed, closing a gap the pre-Phase-10
+baseline check had: it never called `copy_vendored_dependencies` or any
+install step at all, so it could already be checking against a
+dependency-less checkout). A cache HIT skips the scratch worktree and the
+sandbox entirely — `tests/test_cache.py`'s
+`test_reproduces_at_uses_a_seeded_cache_without_touching_the_sandbox`
+proves this concretely, by seeding the cache and pointing
+`_reproduces_at` at a Docker backend with no reachable daemon: reaching a
+real answer instead of a `SandboxUnavailableError` is the proof the
+sandbox was never touched.
+
+Bisection's own intermediate-commit checks (`attribution/bisect.py`) are
+deliberately NOT cached — they render a different commit on nearly every
+call by construction, so there's no reuse value the way there is for the
+one commit (`base_commit`) that's identical across every baseline check
+and every before-image in a given attempt.
+
+## The ERROR status: a minimal pull-forward from Phase 11
+
+Phase 9's DESIGN.md assigned "a real ERROR `Verdict` outcome" to Phase 11
+and had `ProvisioningTimeoutError` abort the whole attempt with no
+`Verdict` produced at all. Phase 10 needs the same infra-not-agent
+treatment for its own new failure modes (an unrecognized service
+type/version, a service that never becomes healthy, an unresolvable
+version pin) — and, per an explicit decision made before coding, pulls
+forward a minimal `VerdictStatus.ERROR` now rather than waiting:
+
+- `schema.py`'s `Verdict.error: str | None` field, when set, makes
+  `status` ERROR unconditionally — checked first, ahead of the
+  FAIL/budget/applicable-signals logic the other three statuses derive
+  from, since by construction nothing was actually evaluated.
+- `SetupError` (`sandbox/base.py`) is a new sibling of
+  `ProvisioningTimeoutError` under the same `SandboxUnavailableError`
+  ancestor — one family, one thing Phase 11 will eventually need to catch
+  in one place, not two.
+- **The catch site is what actually changed, not the raise.** A single
+  `verdict run`/`verdict gate` invocation still lets `SandboxError`
+  propagate uncaught straight to `cli.py`'s `_RUN_ERRORS` — exit code 2,
+  no report, unchanged from Phase 9. `suite/runner.py::run_suite` is the
+  one place Phase 10 actually changes behavior: it now catches
+  `SandboxError` **per `(config, task)` pair**, records that task as a
+  real `Verdict(status=ERROR, error=str(exc))`, and moves on to the next
+  task — a suite grading dozens of (agent, task) combinations shouldn't
+  lose everything else it already computed because one repo's Postgres
+  never came up.
+- `ConfigResult.pass_rate` excludes errored tasks from its DENOMINATOR,
+  not just the numerator (`tasks_errored`, new) — a task that was never
+  actually graded shouldn't dilute the rate the way a real observed
+  failure does, in either direction. `0.0` (not `None`) when every task
+  errored, matching the "report an honest number, not a guess" instinct
+  `total_cost_usd`'s own `None`-on-unknown already established elsewhere
+  in this file.
+- `report.py`'s `_VERDICT_STYLE` dict (a plain lookup keyed by the three
+  pre-Phase-10 `VerdictStatus` members, no default) would have raised
+  `KeyError` on any ERROR verdict — caught during this phase's own review
+  and fixed alongside adding the status, not left as a latent crash for
+  whoever first triggered it for real.
+
+Deliberately minimal, per the decision that scoped it: no retry policy,
+no dedicated provenance bucket, no richer reporting beyond the one status
+value, the accounting rule, and not crashing the renderer. Phase 11 is
+still where the fuller shape of this gets designed.
+
+## What's explicitly out of scope for Phase 10
+
+- **Broader version-pin sources** — `pyproject.toml`'s `requires-python`,
+  `package.json`'s `engines.node`, version *ranges* rather than a single
+  pinned value. Only a literal `.python-version`/`.nvmrc` is resolved.
+- **Dependency caching across DIFFERENT commits sharing a lockfile** —
+  the base-state cache reuses gate signals/screenshots for the identical
+  `base_commit`, but doesn't yet cache *installed dependency artifacts*
+  (a `node_modules`/`.venv` snapshot) keyed on `lockfile_hash` alone, which
+  would let two different commits with an unchanged lockfile skip
+  re-installing entirely. Real, valuable, and deferred.
+- **Cache eviction/TTL** — `~/.cache/verdict/base-state/` has no size cap
+  and no expiry; entries accumulate until something (a human, a future
+  `verdict cache clear`) removes them.
+- **Bisection's own scratch worktrees still don't install dependencies**
+  — `attribution/bisect.py::_check_at` renders intermediate commits with
+  no `copy_vendored_dependencies`/`run_setup_step` call, a pre-existing
+  gap this phase fixed for the baseline check specifically but left alone
+  for bisection's many-different-commits case.
+- **Adapter CLIs don't see the version-pin env overlay** — `run_setup_step`'s
+  overlay is threaded to gates, not to `Adapter.run()`'s own `sandbox.exec()`
+  call; an agent that itself shells out to a pinned-version tool during
+  its own work sees the image default, not the resolved pin.
+- **`verdict flaky`'s trial loop doesn't get suite-style ERROR handling**
+  — only `run_suite` catches `SandboxError` per unit of work; a
+  `SandboxError` mid-trial still crashes the whole `verdict flaky`
+  command, same as a single `verdict run` does.
+- **Folding ERROR into a fuller Phase 11 shape** — retry policy, a
+  dedicated provenance bucket, richer reporting. See above.
