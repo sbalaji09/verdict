@@ -1,0 +1,2 @@
+task: "Add a multiply(a, b) function to calculator.py that returns the product of a and b, matching add()'s style."
+category: feature-add

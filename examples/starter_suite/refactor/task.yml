@@ -1,0 +1,2 @@
+task: "The non-negative-amount validation in calculate_us_tax and calculate_eu_tax is duplicated. Extract it into a shared helper function, without changing either function's behavior."
+category: refactor

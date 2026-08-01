@@ -1,0 +1,2 @@
+task: "Fix the bug in add() so it returns the correct sum instead of subtracting."
+category: bug-fix

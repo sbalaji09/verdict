@@ -12,3 +12,6 @@ examples/sample_node_repo/.git/
 examples/sample_node_repo/node_modules/
 examples/sample_node_repo/dist/
 examples/sample_frontend_repo/.git/
+examples/starter_suite/bug-fix/repo/.git/
+examples/starter_suite/refactor/repo/.git/
+examples/starter_suite/feature-add/repo/.git/

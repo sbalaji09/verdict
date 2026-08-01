@@ -41,3 +41,27 @@ class MockAdapter:
             cost_usd=0.0,
             raw_output=f"[mock] applied fixed patch for task: {task!r}",
         )
+
+
+class SuiteMockAdapter:
+    """`MockAdapter`'s multi-task analogue: a single `Adapter.run(task,
+    worktree)` call only ever receives the task's text, not an id, so a
+    suite of several tasks needs its canned patch looked up *by* that text
+    rather than fixed at construction like `MockAdapter` is. Exists for the
+    same reason `MockAdapter` does — so `verdict bench --agent mock` is
+    demoable against the starter suite without real API tokens — not as a
+    general benchmarking adapter.
+    """
+
+    name = "mock"
+
+    def __init__(self, patches_by_task: dict[str, dict[str, str]]) -> None:
+        if not patches_by_task:
+            raise ValueError("SuiteMockAdapter needs at least one task's patches")
+        self._patches_by_task = patches_by_task
+
+    def run(self, task: str, worktree: Path) -> AttemptResult:
+        patches = self._patches_by_task.get(task)
+        if patches is None:
+            raise ValueError(f"SuiteMockAdapter has no canned patch for task: {task!r}")
+        return MockAdapter(patches=patches).run(task, worktree)
