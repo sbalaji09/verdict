@@ -4,6 +4,7 @@ adapter do the work, run the gates, assemble a Verdict.
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from pathlib import Path
 
@@ -13,7 +14,8 @@ from verdict.config import VerdictConfig, load_config
 from verdict.frontend.runner import run_frontend_checks
 from verdict.gates.registry import run_all_gates
 from verdict.sandbox import Sandbox, SandboxConfig, create_sandbox
-from verdict.sandbox.install import run_install_step
+from verdict.sandbox.install import run_setup_step
+from verdict.sandbox.services import ServiceSession, setup_services, teardown_services
 from verdict.schema import AttemptResult, Attribution, Signal, TaskRun, Verdict
 from verdict.worktree import (
     Worktree,
@@ -44,6 +46,19 @@ def _budget_exceeded(deadline: float | None) -> bool:
     return deadline is not None and time.monotonic() >= deadline
 
 
+def _sandbox_config_for_services(sandbox_config: SandboxConfig, session: ServiceSession) -> SandboxConfig:
+    """The gate/adapter sandbox joins the per-attempt service network
+    instead of its plain none/bridge choice when any services were
+    declared (`session.network_name` set) — see `sandbox/services.py`'s
+    module docstring for why an `--internal` network is safe to add here
+    without reopening general internet egress. No services declared
+    (the common case) → `sandbox_config` passes through unchanged.
+    """
+    if session.network_name is None:
+        return sandbox_config
+    return dataclasses.replace(sandbox_config, network_name=session.network_name)
+
+
 def run(
     task: str,
     repo: Path,
@@ -55,50 +70,83 @@ def run(
     and return the Verdict. The worktree (and its branch) is always torn
     down before this returns, win or lose.
 
-    `sandbox_config` governs how the adapter's CLI, the install step, gates,
+    `sandbox_config` governs how the adapter's CLI, the setup stage, gates,
     and the frontend dev server actually execute — see `sandbox/config.py`.
     Defaults to `SandboxConfig()` (backend "local") when not given; the
     `verdict` CLI itself passes an explicit config defaulting to "docker"
     (Phase 8's actual product default) via its `--sandbox-backend` flag.
+
+    Phase 10's setup stage runs here, in order, all before gates: declared
+    `services:` are started and health-gated (infra failures raise
+    `SetupError`/`ProvisioningTimeoutError` and abort the whole attempt —
+    never a gate Signal, never NOT_DONE — see DESIGN.md's Phase 10
+    section), then language-version pins are resolved and dependencies
+    installed (`run_setup_step`), producing an env overlay every
+    subsequent gate call gets merged into.
     """
     sandbox_config = sandbox_config or SandboxConfig()
     deadline = _budget_deadline(sandbox_config)
 
     with isolated_worktree(repo) as worktree:
         copy_vendored_dependencies(repo, worktree.path)
-        run_install_step(worktree.path, sandbox_config)
 
-        with create_sandbox(worktree.path, sandbox_config) as sandbox:
-            attempt = adapter.run(task, worktree.path, sandbox=sandbox)
-            diff, files_changed = diff_against_base(worktree.path, worktree.base_commit)
-            attempt = attempt.model_copy(update={"diff": diff, "files_changed": files_changed})
+        # Read once, early, purely to see what services (if any) are
+        # declared — deliberately BEFORE the agent runs, so a service the
+        # agent's own work depends on (e.g. it runs migrations against
+        # `db`) is already up. Gate overrides/frontend config are still
+        # read from the *agent's* post-edit verdict.yml further down,
+        # unchanged from before this phase — only the services list is
+        # read this early.
+        early_config = load_config(worktree.path)
+        service_session = setup_services(early_config.services, sandbox_config.health_timeout_seconds)
 
-            # Commit the agent's work now, before any gate runs — gates (pytest,
-            # mypy, ...) can leave their own artifacts (__pycache__, etc.) in the
-            # worktree as a side effect of executing, and attribution's bisection
-            # must never mistake a gate's own byproduct for something the agent
-            # changed. `attempt_commit` is what attribution treats as "final".
-            attempt_commit = commit_all(worktree.path, "verdict: attempt final state")
+        try:
+            setup_env = run_setup_step(worktree.path, sandbox_config)
+            gate_sandbox_config = _sandbox_config_for_services(sandbox_config, service_session)
 
-            config = load_config(worktree.path)
-            attempt = _apply_pricing_fallback(attempt, config)
+            with create_sandbox(worktree.path, gate_sandbox_config) as sandbox:
+                attempt = adapter.run(task, worktree.path, sandbox=sandbox)
+                diff, files_changed = diff_against_base(worktree.path, worktree.base_commit)
+                attempt = attempt.model_copy(update={"diff": diff, "files_changed": files_changed})
 
-            signals, attributions, budget_exceeded = _run_gates_and_attribution(
-                repo, worktree.path, worktree, attempt_commit, config, sandbox, sandbox_config, deadline
-            )
+                # Commit the agent's work now, before any gate runs — gates (pytest,
+                # mypy, ...) can leave their own artifacts (__pycache__, etc.) in the
+                # worktree as a side effect of executing, and attribution's bisection
+                # must never mistake a gate's own byproduct for something the agent
+                # changed. `attempt_commit` is what attribution treats as "final".
+                attempt_commit = commit_all(worktree.path, "verdict: attempt final state")
 
-            # Frontend checks run after gates/attribution, and their signals are
-            # appended afterward rather than folded into `signals` beforehand —
-            # attribution's bisector only knows the four gate names in
-            # gates/registry.py's GATE_RUNNERS, and would crash trying to
-            # `resolve_gate("frontend:...")`. A failing frontend check is real
-            # PROVEN evidence for Verdict.status either way; it's just not
-            # (yet) bisectable to a culprit file the way test/typecheck/build/
-            # lint failures are.
-            if budget_exceeded or _budget_exceeded(deadline):
-                budget_exceeded = True
-            else:
-                signals = signals + run_frontend_checks(repo, worktree, config, task, sandbox=sandbox)
+                config = load_config(worktree.path)
+                attempt = _apply_pricing_fallback(attempt, config)
+
+                signals, attributions, budget_exceeded = _run_gates_and_attribution(
+                    repo,
+                    worktree.path,
+                    worktree,
+                    attempt_commit,
+                    config,
+                    sandbox,
+                    sandbox_config,
+                    deadline,
+                    setup_env,
+                )
+
+                # Frontend checks run after gates/attribution, and their signals are
+                # appended afterward rather than folded into `signals` beforehand —
+                # attribution's bisector only knows the four gate names in
+                # gates/registry.py's GATE_RUNNERS, and would crash trying to
+                # `resolve_gate("frontend:...")`. A failing frontend check is real
+                # PROVEN evidence for Verdict.status either way; it's just not
+                # (yet) bisectable to a culprit file the way test/typecheck/build/
+                # lint failures are.
+                if budget_exceeded or _budget_exceeded(deadline):
+                    budget_exceeded = True
+                else:
+                    signals = signals + run_frontend_checks(
+                        repo, worktree, config, task, sandbox=sandbox, sandbox_config=sandbox_config
+                    )
+        finally:
+            teardown_services(service_session)
 
     return Verdict(
         task=task,
@@ -120,6 +168,7 @@ def _run_gates_and_attribution(
     sandbox: Sandbox,
     sandbox_config: SandboxConfig,
     deadline: float | None,
+    env: dict[str, str] | None = None,
 ) -> tuple[list[Signal], list[Attribution], bool]:
     """Shared by `run()` and `grade_existing_diff()`: run every gate (or
     stop early at `deadline`), then attribute failures — but only if the
@@ -132,6 +181,13 @@ def _run_gates_and_attribution(
     grades `repo` in place — its `Worktree.path` and the `repo` gates run
     in are the same directory, but that's a coincidence of that mode, not
     something this shared helper should assume.
+
+    `env` (Phase 10) is the version-pin overlay from `run_setup_step` —
+    merged into every gate's own execution env, empty for the unpinned
+    case. Attribution's own baseline/bisection re-renders resolve their
+    own overlay independently (they render different worktree states, at
+    different commits, than `gate_worktree_path`), so `env` is NOT passed
+    to `attribute_failures` — only to the top-level gate run here.
     """
     signals, gates_budget_exceeded = run_all_gates(
         gate_worktree_path,
@@ -139,6 +195,7 @@ def _run_gates_and_attribution(
         sandbox=sandbox,
         timeout_seconds=sandbox_config.gate_timeout_seconds,
         deadline=deadline,
+        env=env,
     )
     if gates_budget_exceeded or _budget_exceeded(deadline):
         return signals, [], True
@@ -163,6 +220,13 @@ def grade_existing_diff(
     this function executes *in* `repo` is the gates/frontend checks
     themselves (pytest, tsc, a dev server, ...), exactly as a CI job
     already expects to happen in its own checkout.
+
+    Unlike `run()`, there's no setup stage here beyond services — `repo`
+    is graded exactly as already checked out, dependencies assumed
+    already installed by whatever CI job invoked this (unchanged from
+    before Phase 10). Declared `services:` still start and health-gate
+    first, though — a CI checkout with a real test suite needing Postgres
+    is a common, real case this command should support too.
     """
     repo = repo.resolve()
     base_commit = rev_parse(repo, base_ref)
@@ -184,16 +248,22 @@ def grade_existing_diff(
     deadline = _budget_deadline(sandbox_config)
 
     config = load_config(repo)
-    with create_sandbox(repo, sandbox_config) as sandbox:
-        signals, attributions, budget_exceeded = _run_gates_and_attribution(
-            repo, repo, worktree, final_commit, config, sandbox, sandbox_config, deadline
-        )
-        if budget_exceeded or _budget_exceeded(deadline):
-            budget_exceeded = True
-        else:
-            signals = signals + run_frontend_checks(
-                repo, worktree, config, task="pull request diff", sandbox=sandbox
+    service_session = setup_services(config.services, sandbox_config.health_timeout_seconds)
+    try:
+        gate_sandbox_config = _sandbox_config_for_services(sandbox_config, service_session)
+        with create_sandbox(repo, gate_sandbox_config) as sandbox:
+            signals, attributions, budget_exceeded = _run_gates_and_attribution(
+                repo, repo, worktree, final_commit, config, sandbox, sandbox_config, deadline
             )
+            if budget_exceeded or _budget_exceeded(deadline):
+                budget_exceeded = True
+            else:
+                signals = signals + run_frontend_checks(
+                    repo, worktree, config, task="pull request diff", sandbox=sandbox,
+                    sandbox_config=sandbox_config,
+                )
+    finally:
+        teardown_services(service_session)
 
     return Verdict(
         task="grade existing diff",

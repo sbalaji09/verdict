@@ -60,6 +60,7 @@ def _build_sandbox_config(
     provision_timeout_seconds: int,
     install_timeout_seconds: int,
     attempt_budget_seconds: int,
+    health_timeout_seconds: int,
 ) -> SandboxConfig:
     if sandbox_backend not in ("docker", "local"):
         raise typer.BadParameter(f"unknown --sandbox-backend: {sandbox_backend!r} (choices: docker, local)")
@@ -74,6 +75,7 @@ def _build_sandbox_config(
         # a bare `None` from the command line, so 0 is the user-facing
         # spelling of SandboxConfig.attempt_budget_seconds=None.
         attempt_budget_seconds=attempt_budget_seconds if attempt_budget_seconds > 0 else None,
+        health_timeout_seconds=health_timeout_seconds,
     )
 
 
@@ -293,6 +295,9 @@ def run_cmd(
         "--attempt-budget-seconds",
         help="Global wall-clock ceiling across one whole attempt. 0 disables it.",
     ),
+    health_timeout_seconds: int = typer.Option(
+        30, "--health-timeout-seconds", help="How long a declared service gets to pass its health check."
+    ),
 ) -> None:
     """Run an agent against one task (retrying on failure if --max-attempts > 1)
     and print its Verdict plus the cost across every attempt made.
@@ -305,6 +310,7 @@ def run_cmd(
     sandbox_config = _build_sandbox_config(
         sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb,
         gate_timeout_seconds, provision_timeout_seconds, install_timeout_seconds, attempt_budget_seconds,
+        health_timeout_seconds,
     )
     try:
         task_run = run_with_retries(
@@ -364,6 +370,9 @@ def bench_cmd(
         "--attempt-budget-seconds",
         help="Global wall-clock ceiling across one whole attempt. 0 disables it.",
     ),
+    health_timeout_seconds: int = typer.Option(
+        30, "--health-timeout-seconds", help="How long a declared service gets to pass its health check."
+    ),
 ) -> None:
     """Run every --agent against every task in --suite, then print a
     pass-rate-per-dollar leaderboard and a failure-mode breakdown.
@@ -381,6 +390,7 @@ def bench_cmd(
     sandbox_config = _build_sandbox_config(
         sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb,
         gate_timeout_seconds, provision_timeout_seconds, install_timeout_seconds, attempt_budget_seconds,
+        health_timeout_seconds,
     )
 
     try:
@@ -430,6 +440,9 @@ def gate_cmd(
         "--attempt-budget-seconds",
         help="Global wall-clock ceiling across one whole attempt. 0 disables it.",
     ),
+    health_timeout_seconds: int = typer.Option(
+        30, "--health-timeout-seconds", help="How long a declared service gets to pass its health check."
+    ),
 ) -> None:
     """Grade `--repo` exactly as it's already checked out against `--base`
     — no adapter, no isolation. This is the merge-gate command: a pull
@@ -442,6 +455,7 @@ def gate_cmd(
     sandbox_config = _build_sandbox_config(
         sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb,
         gate_timeout_seconds, provision_timeout_seconds, install_timeout_seconds, attempt_budget_seconds,
+        health_timeout_seconds,
     )
     try:
         verdict = grade_existing_diff(repo=repo, base_ref=base, sandbox_config=sandbox_config)
@@ -542,6 +556,9 @@ def flaky_cmd(
         "--attempt-budget-seconds",
         help="Global wall-clock ceiling across one whole attempt. 0 disables it.",
     ),
+    health_timeout_seconds: int = typer.Option(
+        30, "--health-timeout-seconds", help="How long a declared service gets to pass its health check."
+    ),
 ) -> None:
     """Run `--agent` on `--task` against `--repo` `--trials` independent
     times and report the pass rate with a Wilson confidence interval. With
@@ -557,6 +574,7 @@ def flaky_cmd(
     sandbox_config = _build_sandbox_config(
         sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb,
         gate_timeout_seconds, provision_timeout_seconds, install_timeout_seconds, attempt_budget_seconds,
+        health_timeout_seconds,
     )
     try:
         result = run_flakiness(

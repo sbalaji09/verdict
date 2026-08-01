@@ -103,16 +103,45 @@ class TokenPricing:
         return (tokens_input / 1000) * self.input_per_1k + (tokens_output / 1000) * self.output_per_1k
 
 
+@dataclass
+class ServiceSpec:
+    """One declared service dependency (Phase 10) — a Postgres/Redis/etc.
+    the repo's own code or test suite needs running to boot. Deliberately
+    thin: `type`/`version` name an entry in Verdict's OWN image allowlist
+    (`sandbox/services.py`), never a raw `image:` string — a `verdict.yml`
+    living in the untrusted repo being graded must never get to pick an
+    arbitrary image for Verdict to `docker run`, the same "sandbox policy
+    never comes from the repo" rule Phase 8 established for everything
+    else in this module. Whether `type`/`version` are actually *known* is
+    checked at setup time (`sandbox/services.py`), not here — an unknown
+    combination is a real, surfaced ERROR, not something this parser
+    should silently drop the way a malformed optional field elsewhere in
+    this module would be.
+    """
+
+    name: str
+    """DNS hostname other containers (the gate container, other services)
+    resolve this one by — a `--network-alias`, not a real domain."""
+    type: str
+    version: str
+    env: dict[str, str] = field(default_factory=dict)
+    port: int | None = None
+    """None uses the service type's own standard port (5432 for postgres,
+    6379 for redis, ...) — see `sandbox/services.py`'s allowlist."""
+
+
 class VerdictConfig:
     def __init__(
         self,
         gate_overrides: dict[str, str],
         token_pricing: TokenPricing | None = None,
         frontend: FrontendConfig | None = None,
+        services: list[ServiceSpec] | None = None,
     ) -> None:
         self.gate_overrides = gate_overrides
         self.token_pricing = token_pricing
         self.frontend = frontend
+        self.services = services or []
 
     def override_for(self, gate: str) -> str | None:
         return self.gate_overrides.get(gate)
@@ -219,6 +248,31 @@ def _parse_frontend_config(data: dict[str, object]) -> FrontendConfig | None:
     )
 
 
+def _parse_services(raw: object) -> list[ServiceSpec]:
+    if not isinstance(raw, list):
+        return []
+    services: list[ServiceSpec] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name, kind, version = item.get("name"), item.get("type"), item.get("version")
+        if not name or not kind or not version:
+            # Missing a required field entirely is a malformed *entry* —
+            # same per-item skip `_parse_checks` already uses elsewhere in
+            # this module. An entry that names a real but *unrecognized*
+            # type/version is different (a real, satisfiable-looking
+            # request Verdict can't fulfill) and is deliberately NOT
+            # caught here — see `sandbox/services.py`, which raises a
+            # surfaced ERROR for that case rather than silently dropping
+            # the service the way this loop drops a malformed entry.
+            continue
+        env_raw = item.get("env") or {}
+        env = {str(k): str(v) for k, v in env_raw.items()} if isinstance(env_raw, dict) else {}
+        port = int(item["port"]) if item.get("port") else None
+        services.append(ServiceSpec(name=str(name), type=str(kind), version=str(version), env=env, port=port))
+    return services
+
+
 def load_config(worktree: Path) -> VerdictConfig:
     path = worktree / "verdict.yml"
     if not path.exists():
@@ -235,4 +289,5 @@ def load_config(worktree: Path) -> VerdictConfig:
         gate_overrides=overrides,
         token_pricing=_parse_token_pricing(data),
         frontend=_parse_frontend_config(data),
+        services=_parse_services(data.get("services")),
     )

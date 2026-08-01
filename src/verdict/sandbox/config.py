@@ -64,6 +64,22 @@ class SandboxConfig:
     stops the attempt from starting anything further and marks the
     resulting `Verdict.budget_exceeded = True` (see `schema.py`)."""
 
+    # --- Phase 10: service-dependency networking ---------------------------
+    network_name: str | None = None
+    """Set only by `runner.py`, per-attempt, when `verdict.yml` declares
+    `services:` — joins the gate/adapter container to that specific
+    `--internal` Docker network (`sandbox/services.py`) instead of the
+    plain `network` bool's none-vs-bridge choice, so gates can reach
+    declared services by name without gaining general internet egress.
+    Never set by a caller constructing `SandboxConfig` directly; this is
+    attempt-scoped state threaded through, not a standing setting."""
+
+    health_timeout_seconds: int = 30
+    """How long a declared service gets to pass its health check before
+    `sandbox/services.py::start_services` gives up and raises
+    `SetupError` — infra, not the agent's fault, same bucket as every
+    other Phase 9/10 setup failure."""
+
 
 def create_sandbox(worktree: Path, config: SandboxConfig | None = None) -> Sandbox:
     """Construct (but do not yet `__enter__`) a `Sandbox` for `worktree`
@@ -78,6 +94,7 @@ def create_sandbox(worktree: Path, config: SandboxConfig | None = None) -> Sandb
             limits=config.limits,
             network=config.network,
             provision_timeout_seconds=config.provision_timeout_seconds,
+            network_name=config.network_name,
         )
     if config.backend == "local":
         return LocalSandbox()

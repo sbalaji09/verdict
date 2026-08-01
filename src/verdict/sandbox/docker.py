@@ -83,6 +83,58 @@ def _check_daemon_reachable() -> None:
         )
 
 
+def run_docker_cli(args: list[str], timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+    """Public escape hatch for the trusted `docker` CLI, for sibling
+    modules that need it directly (`sandbox/services.py`'s network/
+    service-container lifecycle) rather than going through a `Sandbox`
+    instance's `exec()` — a service container isn't an `exec()` target
+    the way the gate/adapter container is, it's infrastructure `docker
+    run`/`docker network` manage on their own. Same trust boundary as
+    `DockerSandbox` itself: `args` must be argv Verdict constructs, never
+    a string built from untrusted input.
+    """
+    return _docker(args, timeout=timeout)
+
+
+def create_network(name: str, timeout: float = 30) -> None:
+    """`--internal`: Docker refuses to route this network to the public
+    internet at all (no default gateway to the outside), which is what
+    makes it safe for gates to join it — the point of a per-attempt
+    service network is "services reachable, internet still not," not a
+    general-purpose networking escape hatch. See DESIGN.md's Phase 10
+    section for the containment test proving this holds.
+    """
+    result = _docker(["network", "create", "--internal", name], timeout=timeout)
+    if result.returncode != 0:
+        raise SandboxUnavailableError(f"docker network create failed: {result.stderr.strip()}")
+
+
+def remove_network(name: str, timeout: float = 30) -> None:
+    """Best-effort — never raises. Docker itself refuses to remove a
+    network that still has containers attached, which is exactly the
+    safety property `sweep_leaked_networks` below leans on.
+    """
+    _docker(["network", "rm", name], timeout=timeout)
+
+
+def sweep_leaked_networks(prefix: str = "verdict-attempt-", timeout: float = 30) -> None:
+    """Run once at the start of a batch of work (a `bench`/suite run, or
+    a single `run`) to clean up per-attempt networks a previous crashed
+    process never got to tear down in its own `finally`. Best-effort and
+    silent: a network still attached to a live container (a genuinely
+    concurrent run, not an orphan) simply fails to remove and is left
+    alone — `docker network rm` never removes an in-use network.
+    """
+    filter_args = ["network", "ls", "--filter", f"name={prefix}", "--format", "{{.Name}}"]
+    result = _docker(filter_args, timeout=timeout)
+    if result.returncode != 0:
+        return
+    for name in result.stdout.splitlines():
+        name = name.strip()
+        if name.startswith(prefix):
+            remove_network(name, timeout=timeout)
+
+
 def _read_file(container: str, path: str) -> str:
     result = _docker(["exec", container, "sh", "-c", f"cat {path} 2>/dev/null || true"])
     return result.stdout
@@ -150,13 +202,24 @@ class DockerSandbox:
         limits: ResourceLimits | None = None,
         network: bool = False,
         provision_timeout_seconds: int = DEFAULT_PROVISION_TIMEOUT_SECONDS,
+        network_name: str | None = None,
     ) -> None:
+        """`network_name` (Phase 10) joins a specific pre-created Docker
+        network (a per-attempt `--internal` service network — see
+        `sandbox/services.py`) instead of the plain `none`/`bridge` choice
+        `network` makes. Takes priority over `network` when set — a
+        caller that names a specific network has already made the
+        none-vs-bridge decision implicitly (an `--internal` network has
+        no route out, same effective isolation as `none`, plus service
+        reachability `none` doesn't have).
+        """
         if shutil.which("docker") is None:
             raise SandboxUnavailableError("`docker` CLI not found on PATH")
         self._worktree = worktree
         self._image = image
         self._limits = limits or ResourceLimits()
         self._network = network
+        self._network_name = network_name
         self._provision_timeout_seconds = provision_timeout_seconds
         self._container: str | None = None
 
@@ -181,7 +244,7 @@ class DockerSandbox:
             "--tmpfs",
             "/tmp:rw,size=256m",
             "--network",
-            "bridge" if self._network else "none",
+            self._network_name or ("bridge" if self._network else "none"),
             "--cpus",
             str(self._limits.cpu_cores),
             "--memory",
