@@ -2117,3 +2117,202 @@ carries the same note inline.
 - **Multi-repo/multi-tenant resource isolation** — this phase's unit is
   one worktree, one container; nothing here addresses running many
   untrusted repos' sandboxes concurrently on shared infrastructure.
+
+## Phase 9 — Timeouts, Kill-Trees, and the Attempt Budget
+
+## The gap Phase 8 left open
+
+Phase 8 gave every command a *timeout parameter* — `exec_command`,
+`Sandbox.exec()` all accepted `timeout_seconds` from the start. What Phase
+8 did NOT make robust:
+
+- A timeout only ever killed the **one process** `exec()` started. Nothing
+  killed what that process itself forked. A hung dev server that spawned
+  a real child process, or a hung test that spawned its own subprocess,
+  left that child running — an **orphan**, potentially still bound to a
+  port — after the "timed-out" parent was gone. `DockerSandbox.
+  exec_background`'s original pidfile scheme made this concrete: it
+  tracked the wrapped shell's own PID, then `exec`'d into the real
+  command, so `terminate()`'s `kill <pid>` only ever reached one process,
+  by construction.
+- There was no **global** ceiling. Four gates timing out at their
+  individual `timeout_seconds` each could still add up to an unbounded
+  total, and nothing stopped a run from grinding through install → gate 1
+  → gate 2 → attribution → frontend checks indefinitely if each individual
+  step stayed just under its own limit.
+- CPU/memory/pids limits were passed to `docker run`, but disk had no
+  enforcement attempt at all, and there was no distinction anywhere in the
+  code between "a gate hung" and "the sandbox itself never came up" — both
+  would have produced roughly the same shape of failure.
+
+Phase 9 closes all three, and — per an explicit design decision made
+before writing any of it — draws one more line the code didn't draw
+before: which of those failures is the **agent's** fault, and which is
+**infrastructure's**.
+
+## The kill-tree fix: process groups, not process IDs
+
+Every backend now launches the command it's given as the leader of its
+own process group (`start_new_session=True` for `LocalSandbox`'s
+`subprocess.Popen`; `setsid` for `DockerSandbox`'s in-container wrapper —
+`setsid cmd`'s PID *is* its own process-group id, since `setsid` makes the
+process it execs into both a new session leader and, by consequence, a new
+process-group leader). Killing on timeout always targets the **group**
+(`os.killpg` locally; `kill -TERM -PID` — the leading `-` is what makes it
+a group signal — inside the container), not the one PID that was started.
+Every child and grandchild the command forked, as long as none of them
+independently called `setsid`/`setpgid` to escape the group (ordinary dev
+servers and test runners don't), dies with it.
+
+`DockerSandbox.exec()` itself changed shape to make this possible mid-
+session: it used to be one blocking `docker exec`, whose host-side
+timeout killed the **host's** `docker` CLI process while leaving whatever
+was running *inside* the container untouched — the timeout would return,
+but the workload kept running in a container about to be reused for the
+next gate. Phase 9 makes `exec()` a tracked, polled operation instead:
+launch detached (`docker exec -d`) under `setsid`, with the command's own
+(group) pid recorded to a pidfile inside the container; poll for an
+exit-code marker file up to `timeout_seconds`; on timeout, explicitly
+`kill -TERM -PID` then `-KILL` the group before returning. This is the
+same mechanism `exec_background` (the dev server) already needed, just
+also applied to the blocking gate-execution path — one shared
+`_start_tracked`/kill helper serves both.
+
+`tests/test_sandbox_killtree.py` proves the actual claim end to end
+against `LocalSandbox`: a script that forks a grandchild which binds a
+real port and sleeps, itself hangs forever (the "agent-introduced
+infinite loop" shape), gets `exec()`'d with a 2-second timeout, and the
+test then independently verifies — not by trusting the killed process's
+own exit code, but by trying to re-bind the port and checking the
+grandchild's PID directly — that both the port is free and the grandchild
+is gone. `test_sandbox_docker_adversarial.py`'s equivalent (Docker-gated)
+additionally proves the *session* survives a timed-out `exec()` — a
+follow-up command in the same container still runs, since only that one
+command's tree was killed, not the whole container.
+
+## Resource limits: what's enforced, what's attempted, what's still open
+
+CPU/memory/pids limits were already passed to `docker run` in Phase 8 and
+needed no change — they're session-level (cgroup limits apply to the
+whole container, every `exec()` call against it, for its lifetime), which
+is exactly the granularity Phase 9's shared-container-across-gates design
+needs. Phase 9 adds a best-effort attempt at **disk**: `--storage-opt
+size=<disk_mb>m` on `docker run`, which only actually works with specific
+storage-driver/backing-filesystem combinations (overlay2 on xfs with
+pquota — notably NOT the common ext4-backed default). Rather than fail
+every run whose Docker install doesn't support it, `DockerSandbox.
+__enter__` tries once with the flag and, on failure, retries once without
+it — a storage-driver mismatch degrades to "no disk quota," not "no
+sandbox at all." What Phase 9 does NOT add: OOM-specific detection
+(`ExecResult.killed_reason` is `"timeout"` or `None` — never `"oom"` yet,
+even though `--memory` can and does kill a process today) or real
+enforcement of a per-command (as opposed to per-container) resource
+ceiling. Both are explicitly deferred — see below.
+
+## The agent-fault / infra-fault distinction
+
+This was a design decision made explicitly before writing any of this
+phase's code (see the conversation that scoped it), not something the
+implementation backed into. Two failure shapes look superficially similar
+— "something didn't finish in time" — but mean opposite things:
+
+- **A gate hangs.** The agent wrote (or left broken) code that a test
+  suite, typechecker, linter, or build step never returns on. This is
+  real, observed evidence about the agent's own output — exactly as real
+  as any other nonzero exit code. It is graded as a normal **PROVEN
+  FAIL**, no special status: `exec_command` labels the resulting FAIL's
+  detail text with `"timed out after Ns"` so a human reading the report
+  understands *why* it failed, but `GateStatus` itself needs no new value
+  — timeout already produces exit code 124, and every existing parser
+  already treats a nonzero exit as FAIL. `ToolRunner.run()`'s own
+  docstring now says this explicitly, so a future gate implementation
+  doesn't have to rediscover it.
+- **Provisioning hangs.** The sandbox container never comes up
+  (`docker run` itself times out), or the dependency-install step never
+  finishes (`npm install` stuck against a broken registry). Neither of
+  these is something the agent wrote — the agent didn't author the
+  install command, and it certainly didn't author Verdict's own container
+  startup. These raise `ProvisioningTimeoutError` (a subclass of the
+  existing `SandboxUnavailableError`, itself a `RuntimeError`) and **abort
+  the whole attempt** — no Verdict is produced, exactly the same way an
+  adapter CLI (`claude`, `aider`, ...) hanging already aborted the attempt
+  before this phase. `cli.py`'s `_RUN_ERRORS` tuple — already the single
+  place every "this attempt couldn't be evaluated" exception type is
+  caught and turned into a clean exit-code-2 CLI error — now includes
+  `SandboxUnavailableError` (covering both the timeout subclass and the
+  pre-existing "daemon unreachable" case, which, before this phase, wasn't
+  actually caught there either and would have surfaced as a raw
+  traceback).
+
+  `ProvisioningTimeoutError` subclassing `SandboxUnavailableError`
+  specifically (rather than being its own unrelated exception) is a
+  forward-looking choice: Phase 11 is expected to introduce a real ERROR
+  outcome and fold this whole "couldn't evaluate" family into it. Keeping
+  every member of that family in one hierarchy now means Phase 11 has one
+  ancestor type to catch, not several scattered `except` clauses to find
+  and update.
+
+- **The global attempt budget exceeding** is deliberately a *third*
+  thing, not folded into either bucket above. It's not the agent's fault
+  (nothing it wrote timed out) and it's not quite an infra failure either
+  (nothing actually broke — there just wasn't enough time to check
+  everything). See the next section.
+
+## The global per-attempt budget
+
+`SandboxConfig.attempt_budget_seconds` (default 1800s / 30 minutes, `None`
+disables it) is a single wall-clock ceiling computed once at the start of
+`runner.run()`/`grade_existing_diff()` — covering the adapter's own run,
+the install step, every gate, attribution's bisection, and the frontend
+checks combined, not an independent allowance re-granted per phase. Both
+entry points check the same deadline before starting each subsequent
+phase (`gates/registry.py::run_all_gates` checks it before each individual
+gate too, not just once at the top of the loop) and, once it's passed,
+skip everything remaining rather than attempting it.
+
+Skipped gates are simply **absent** from `Verdict.signals`, not present
+with some placeholder status — reporting them as FAIL would blame the
+agent for something Verdict itself never checked; reporting them as NA
+would misrepresent "we didn't get to it" as "this repo has no such stack."
+`Verdict.budget_exceeded: bool` carries the fact itself, and `status`'s
+logic (see `schema.py`) was extended with one rule, decided explicitly
+rather than left implicit:
+
+- A real, observed PROVEN FAIL always wins, budget or not. An agent-caused
+  failure that was actually witnessed doesn't stop being real just
+  because the run later ran out of time somewhere else — it's still
+  NOT_DONE, and it still counts against the agent in `pass_rate`/
+  `pass_rate_per_dollar`.
+- A `budget_exceeded` run that saw **no** FAIL is never DONE. "Every gate
+  we managed to run passed" is a materially weaker claim than "every gate
+  passed" when some gates never ran at all — the same reasoning
+  `VerdictStatus.UNVERIFIED` already existed for (zero PROVEN gates ran at
+  all); Phase 9 just extends it to cover "some ran, some didn't, and none
+  of the ones that did found anything wrong" as the same kind of
+  incomplete-therefore-unproven claim, rather than inventing a fourth
+  status.
+
+## What's explicitly out of scope for Phase 9
+
+- **OOM-specific detection** — `ExecResult.killed_reason` only
+  distinguishes `"timeout"` from `None` today; a process killed by
+  `--memory`'s cgroup limit currently just looks like any other nonzero
+  exit, not a specifically-flagged OOM. Real detection needs reading the
+  container's own OOM-kill status (`docker inspect`'s `OOMKilled` field)
+  rather than inferring it from an exit code.
+- **A real per-command CPU/memory ceiling** — today's limits are
+  per-container (shared across every gate run in that session), not
+  re-enforced or re-partitioned per individual `exec()` call.
+- **Disk quota portability** — the `--storage-opt size=` best-effort
+  attempt silently degrades to "no quota" on the common storage-driver
+  configurations that don't support it; there's no fallback enforcement
+  mechanism (a periodic `du` check and manual kill, for instance) for
+  those cases.
+- **Folding `ProvisioningTimeoutError`/`SandboxUnavailableError` into a
+  real ERROR `Verdict` outcome** — that's Phase 11, as noted above; today
+  they abort the attempt (no `Verdict` at all) rather than producing one
+  tagged ERROR.
+- **Per-phase (rather than global) budgets** — there's no separate "the
+  adapter itself gets at most N minutes of the 30" sub-allocation; the
+  budget is one shared pool, first-come-first-served across phases in
+  execution order.
