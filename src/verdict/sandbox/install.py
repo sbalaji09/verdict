@@ -11,6 +11,16 @@ Phase 10: broader/more accurate autodetection, dependency caching across
 runs, resolving a repo's pinned language version (the fat image's
 `pyenv`/`nvm` exist for this, unused so far), and service dependencies
 (databases, etc.).
+
+Phase 9 draws one explicit line through this module's error handling: a
+sandbox that can't be provisioned AT ALL (no Docker daemon, image missing)
+degrades silently, same as before — gates downstream will honestly surface
+whatever missing-dependency consequence that has, and there's nothing more
+specific to say. But a install COMMAND that hangs (`npm install` stuck on
+a broken registry, say) is provisioning infrastructure timing out, not the
+agent's fault to grade — see DESIGN.md's Phase 9 section — so that specific
+case raises `ProvisioningTimeoutError` and aborts the attempt instead of
+being swallowed into "well, gates will notice eventually."
 """
 
 from __future__ import annotations
@@ -18,7 +28,7 @@ from __future__ import annotations
 import dataclasses
 from pathlib import Path
 
-from verdict.sandbox.base import SandboxError
+from verdict.sandbox.base import ProvisioningTimeoutError, SandboxError
 from verdict.sandbox.config import SandboxConfig, create_sandbox
 
 
@@ -38,11 +48,13 @@ def _detect_install_command(worktree: Path) -> list[str] | None:
 
 
 def run_install_step(worktree: Path, config: SandboxConfig) -> None:
-    """Best-effort: a missing tool or unreachable network here degrades to
+    """A missing tool, unreachable daemon, or unreachable network — the
+    sandbox simply couldn't be provisioned at all — degrades silently to
     "dependencies weren't installed," which gates downstream will then
     honestly report as their own real failure (a missing binary, an import
-    error) — not something this step should hide by raising, but also not
-    something worth pretending succeeded.
+    error). A provisioning TIMEOUT is different and is not swallowed here
+    — see module docstring: it raises `ProvisioningTimeoutError`, aborting
+    the whole attempt the same way an adapter CLI hanging already does.
     """
     command = _detect_install_command(worktree)
     if command is None:
@@ -51,6 +63,16 @@ def run_install_step(worktree: Path, config: SandboxConfig) -> None:
     install_config = dataclasses.replace(config, network=True)
     try:
         with create_sandbox(worktree, install_config) as sandbox:
-            sandbox.exec(command, cwd=worktree, network=True, timeout_seconds=600)
+            result = sandbox.exec(
+                command, cwd=worktree, network=True, timeout_seconds=config.install_timeout_seconds
+            )
+    except ProvisioningTimeoutError:
+        raise
     except SandboxError:
         return
+
+    if result.timed_out:
+        raise ProvisioningTimeoutError(
+            f"dependency install ({' '.join(command)}) timed out after "
+            f"{config.install_timeout_seconds}s"
+        )

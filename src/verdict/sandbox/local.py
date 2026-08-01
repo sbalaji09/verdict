@@ -65,6 +65,37 @@ def _baseline_env() -> dict[str, str]:
     }
 
 
+def _kill_process_group(proc: subprocess.Popen[str], grace_seconds: float) -> None:
+    """SIGTERM, then SIGKILL after `grace_seconds`, aimed at `proc`'s whole
+    process *group* rather than just `proc` itself — every child/grandchild
+    it spawned (a dev server's forked node, a test runner's own worker
+    processes) dies with it. Requires `proc` to have been started with
+    `start_new_session=True`, which makes `proc.pid` its own process-group
+    leader; killing a plain child PID (no group) is exactly the bug that
+    used to leave orphans holding ports — see DESIGN.md's Phase 9 section.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+        proc.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            pass
+    except ProcessLookupError:
+        pass
+
+
 class _LocalBackgroundHandle:
     def __init__(self, proc: subprocess.Popen[str], log_path: Path) -> None:
         self._proc = proc
@@ -82,23 +113,7 @@ class _LocalBackgroundHandle:
                 return ""
 
     def terminate(self, grace_seconds: float = _TERMINATE_GRACE_SECONDS) -> None:
-        if self._proc.poll() is not None:
-            return
-        try:
-            pgid = os.getpgid(self._proc.pid)
-        except ProcessLookupError:
-            return
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-            self._proc.wait(timeout=grace_seconds)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            self._proc.wait(timeout=grace_seconds)
-        except ProcessLookupError:
-            pass
+        _kill_process_group(self._proc, grace_seconds)
 
 
 class LocalSandbox:
@@ -127,25 +142,40 @@ class LocalSandbox:
     ) -> ExecResult:
         full_env = {**_baseline_env(), **(env or {})}
         try:
-            result = subprocess.run(
+            # `start_new_session=True` (not plain Popen) so a timeout can
+            # kill the *whole* process group `cmd` spawned, not just `cmd`
+            # itself — plain `subprocess.run(timeout=...)` only ever kills
+            # the one PID it started, leaving any children `cmd` forked
+            # (a hung test's own subprocess, a lint tool's worker pool)
+            # running as orphans. See `_kill_process_group`.
+            proc = subprocess.Popen(
                 cmd,
                 cwd=cwd,
                 env=full_env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout_seconds,
-            )
-            return ExecResult(exit_code=result.returncode, stdout=result.stdout, stderr=result.stderr)
-        except subprocess.TimeoutExpired as exc:
-            return ExecResult(
-                exit_code=124,
-                stdout=str(exc.stdout or ""),
-                stderr=f"timed out after {timeout_seconds}s",
-                timed_out=True,
-                killed_reason="timeout",
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             return ExecResult(exit_code=127, stdout="", stderr=str(exc))
+
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_seconds)
+            return ExecResult(exit_code=proc.returncode, stdout=stdout, stderr=stderr)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc, _TERMINATE_GRACE_SECONDS)
+            try:
+                stdout, stderr = proc.communicate(timeout=_TERMINATE_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = "", ""
+            return ExecResult(
+                exit_code=124,
+                stdout=stdout or "",
+                stderr=(stderr or "") + f"\ntimed out after {timeout_seconds}s",
+                timed_out=True,
+                killed_reason="timeout",
+            )
 
     def exec_background(
         self,

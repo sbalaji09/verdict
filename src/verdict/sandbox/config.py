@@ -38,6 +38,32 @@ class SandboxConfig:
     forwarding itself.
     """
 
+    # --- Phase 9: timeouts and the global attempt budget ------------------
+    gate_timeout_seconds: int = 600
+    """Per-gate wall-clock ceiling (test/typecheck/build/lint each get their
+    own timer). A gate that times out is reported as a real PROVEN FAIL —
+    see DESIGN.md's Phase 9 section for why a hang is treated as the
+    agent's fault, not infrastructure's."""
+
+    provision_timeout_seconds: int = 120
+    """How long DockerSandbox will wait for `docker run` to bring up a
+    usable container before giving up. Provisioning, not a gate — exceeding
+    this raises `ProvisioningTimeoutError` and aborts the whole attempt
+    rather than becoming any kind of Signal."""
+
+    install_timeout_seconds: int = 300
+    """Ceiling for the dependency-install step (`sandbox/install.py`).
+    Also provisioning, not a gate, for the same reason: the agent didn't
+    write the install command, so a hung `npm install` isn't the agent's
+    fault to be graded on."""
+
+    attempt_budget_seconds: int | None = 1800
+    """Global wall-clock ceiling across one whole attempt — adapter run,
+    install, every gate, attribution, and frontend checks combined. `None`
+    disables it. Exceeding it does not fail anything that already ran; it
+    stops the attempt from starting anything further and marks the
+    resulting `Verdict.budget_exceeded = True` (see `schema.py`)."""
+
 
 def create_sandbox(worktree: Path, config: SandboxConfig | None = None) -> Sandbox:
     """Construct (but do not yet `__enter__`) a `Sandbox` for `worktree`
@@ -46,7 +72,13 @@ def create_sandbox(worktree: Path, config: SandboxConfig | None = None) -> Sandb
     """
     config = config or SandboxConfig()
     if config.backend == "docker":
-        return DockerSandbox(worktree, image=config.image, limits=config.limits, network=config.network)
+        return DockerSandbox(
+            worktree,
+            image=config.image,
+            limits=config.limits,
+            network=config.network,
+            provision_timeout_seconds=config.provision_timeout_seconds,
+        )
     if config.backend == "local":
         return LocalSandbox()
     raise ValueError(f"unknown sandbox backend: {config.backend!r}")

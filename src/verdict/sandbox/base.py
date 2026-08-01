@@ -32,6 +32,25 @@ class SandboxUnavailableError(SandboxError):
     """
 
 
+class ProvisioningTimeoutError(SandboxUnavailableError):
+    """A sandbox never became usable within its provisioning budget — the
+    container never started, or the dependency-install step never
+    finished. Phase 9's explicit distinction: this is an INFRASTRUCTURE
+    failure, not a gate result. It must never become a PROVEN FAIL Signal
+    (that would misattribute an infra problem to the agent) — it aborts
+    the whole attempt instead, the same way an adapter CLI itself hanging
+    already did before this phase (see `cli.py`'s `_RUN_ERRORS`).
+
+    A subclass of `SandboxUnavailableError` on purpose: both mean "this
+    attempt couldn't be evaluated," they just differ in *why* — one
+    timed out, the other found no usable backend at all. Phase 11's ERROR
+    outcome is expected to fold this whole family into one Verdict-level
+    status rather than an attempt-aborting exception; keeping them in one
+    hierarchy now means that later change has one family to catch, not
+    several scattered handlers.
+    """
+
+
 @dataclass(frozen=True)
 class ResourceLimits:
     """CPU/memory/pids/disk ceilings for one sandboxed process tree.
