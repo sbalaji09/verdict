@@ -28,14 +28,15 @@ def resolve_gate(
     config: VerdictConfig,
     sandbox: Sandbox | None = None,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    env: dict[str, str] | None = None,
 ) -> Signal:
     override = config.override_for(gate)
     if override:
-        return raw_signal(gate, override, worktree, sandbox=sandbox, timeout_seconds=timeout_seconds)
+        return raw_signal(gate, override, worktree, sandbox=sandbox, timeout_seconds=timeout_seconds, env=env)
 
     for runner in GATE_RUNNERS[gate]:
         if runner.applicable(worktree):
-            return runner.run(worktree, sandbox=sandbox, timeout_seconds=timeout_seconds)
+            return runner.run(worktree, sandbox=sandbox, timeout_seconds=timeout_seconds, env=env)
 
     return not_applicable(gate)
 
@@ -46,6 +47,7 @@ def run_all_gates(
     sandbox: Sandbox | None = None,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     deadline: float | None = None,
+    env: dict[str, str] | None = None,
 ) -> tuple[list[Signal], bool]:
     """Runs every gate in order, unless `deadline` (a `time.monotonic()`
     timestamp — Phase 9's global per-attempt budget) is reached first, in
@@ -54,10 +56,16 @@ def run_all_gates(
     from the returned list — never reported as FAIL (that would blame the
     agent for something Verdict itself didn't get to check) and never NA
     (NA means "this repo has no such stack," which isn't what happened).
+
+    `env` (Phase 10) is the version-pin overlay from `sandbox/versions.py`
+    — merged into every gate's own env by the sandbox backend, empty for
+    the common unpinned case.
     """
     signals: list[Signal] = []
     for gate in GATE_RUNNERS:
         if deadline is not None and time.monotonic() >= deadline:
             return signals, True
-        signals.append(resolve_gate(gate, worktree, config, sandbox=sandbox, timeout_seconds=timeout_seconds))
+        signals.append(
+            resolve_gate(gate, worktree, config, sandbox=sandbox, timeout_seconds=timeout_seconds, env=env)
+        )
     return signals, False

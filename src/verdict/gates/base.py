@@ -38,6 +38,7 @@ class ToolRunner(Protocol):
         worktree: Path,
         sandbox: Sandbox | None = None,
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        env: dict[str, str] | None = None,
     ) -> Signal:
         """Execute the tool and return a structured PROVEN Signal. Only
         called after `applicable` returned True, and only when no
@@ -46,6 +47,13 @@ class ToolRunner(Protocol):
         (--output-format=json and friends). `sandbox` is None only from
         call sites that haven't been threaded through explicitly (tests);
         real runs always pass one — see registry.py.
+
+        `env` (Phase 10) carries the version-pin overlay
+        (`sandbox/versions.py`) — a resolved `PATH`/`PYENV_VERSION` for a
+        repo that pins a language version via `.python-version`/`.nvmrc`.
+        Empty/`None` for the common unpinned case, in which case the gate
+        runs against whatever the sandbox image defaults to, unchanged
+        from before this phase.
 
         A hang here (`timeout_seconds` elapses) is graded exactly like any
         other nonzero exit: a real PROVEN FAIL, never a special status —
@@ -65,6 +73,7 @@ def exec_command(
     cwd: Path,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     sandbox: Sandbox | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run an argv list inside `sandbox` (never a shell string — we built
     these ourselves, no need to accept the injection surface of a shell).
@@ -72,7 +81,7 @@ def exec_command(
     parsers built against that shape (junit/jest/go-test parsing, etc.)
     don't need to change — only the execution underneath does.
     """
-    result = (sandbox or fallback_sandbox()).exec(args, cwd=cwd, timeout_seconds=timeout_seconds)
+    result = (sandbox or fallback_sandbox()).exec(args, cwd=cwd, timeout_seconds=timeout_seconds, env=env)
     stderr = result.stderr
     if result.timed_out:
         # Folded into stderr (not a separate field) so every existing
@@ -97,6 +106,7 @@ def raw_signal(
     worktree: Path,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     sandbox: Sandbox | None = None,
+    env: dict[str, str] | None = None,
 ) -> Signal:
     """Run an arbitrary shell command (e.g. a verdict.yml override) and
     grade it purely by exit code. No structured parsing: we don't control
@@ -110,7 +120,7 @@ def raw_signal(
     shell-string exception in gates/base.py before Phase 8.
     """
     result = (sandbox or fallback_sandbox()).exec(
-        ["sh", "-c", command], cwd=worktree, timeout_seconds=timeout_seconds
+        ["sh", "-c", command], cwd=worktree, timeout_seconds=timeout_seconds, env=env
     )
     if result.timed_out:
         return Signal(

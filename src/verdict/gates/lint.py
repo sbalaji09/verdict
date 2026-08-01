@@ -73,11 +73,17 @@ class EslintRunner:
         return False
 
     def run(
-        self, worktree: Path, sandbox: Sandbox | None = None, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+        self,
+        worktree: Path,
+        sandbox: Sandbox | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        env: dict[str, str] | None = None,
     ) -> Signal:
         binary = str(worktree / "node_modules" / ".bin" / "eslint")
         command = [binary, ".", "-f", "json"]
-        result = exec_command(command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds)
+        result = exec_command(
+            command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds, env=env
+        )
         detail, status, failures = _parse_eslint(result)
         return Signal(
             name=self.gate,
@@ -126,10 +132,16 @@ class RuffRunner:
         return pyproject.exists() and "[tool.ruff" in pyproject.read_text(errors="ignore")
 
     def run(
-        self, worktree: Path, sandbox: Sandbox | None = None, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+        self,
+        worktree: Path,
+        sandbox: Sandbox | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        env: dict[str, str] | None = None,
     ) -> Signal:
         command = ["ruff", "check", "--output-format=json", "."]
-        result = exec_command(command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds)
+        result = exec_command(
+            command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds, env=env
+        )
         detail, status, failures = _parse_ruff(result)
         return Signal(
             name=self.gate,

@@ -64,11 +64,17 @@ class TscRunner:
         ).exists()
 
     def run(
-        self, worktree: Path, sandbox: Sandbox | None = None, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+        self,
+        worktree: Path,
+        sandbox: Sandbox | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        env: dict[str, str] | None = None,
     ) -> Signal:
         binary = str(worktree / "node_modules" / ".bin" / "tsc")
         command = [binary, "--noEmit", "--pretty", "false"]
-        result = exec_command(command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds)
+        result = exec_command(
+            command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds, env=env
+        )
         detail, status, failures = _parse_tsc(result)
         return Signal(
             name=self.gate,
@@ -122,10 +128,16 @@ class MypyRunner:
         return pyproject.exists() and "[tool.mypy" in pyproject.read_text(errors="ignore")
 
     def run(
-        self, worktree: Path, sandbox: Sandbox | None = None, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+        self,
+        worktree: Path,
+        sandbox: Sandbox | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        env: dict[str, str] | None = None,
     ) -> Signal:
         command = ["mypy", "--output", "json", "."]
-        result = exec_command(command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds)
+        result = exec_command(
+            command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds, env=env
+        )
         detail, status, failures = _parse_mypy(result)
         return Signal(
             name=self.gate,

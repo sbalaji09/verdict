@@ -41,10 +41,16 @@ class NpmBuildRunner:
         return "build" in data.get("scripts", {})
 
     def run(
-        self, worktree: Path, sandbox: Sandbox | None = None, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+        self,
+        worktree: Path,
+        sandbox: Sandbox | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        env: dict[str, str] | None = None,
     ) -> Signal:
         command = ["npm", "run", "build", "--silent"]
-        result = exec_command(command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds)
+        result = exec_command(
+            command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds, env=env
+        )
         detail = tail(result.stdout + result.stderr)
         status = GateStatus.PASS if result.returncode == 0 else GateStatus.FAIL
         return Signal(

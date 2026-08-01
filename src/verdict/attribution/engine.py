@@ -22,10 +22,21 @@ from pathlib import Path
 
 from verdict.attribution.bisect import run_bisect
 from verdict.attribution.depgraph import build_dependency_graph, find_dependency_depth
-from verdict.attribution.reproduce import Reproduction, check_reproduces
+from verdict.attribution.reproduce import Reproduction, reproduction_from_signal
 from verdict.attribution.synth import build_synthetic_ladder
+from verdict.config import load_config
+from verdict.gates.registry import run_all_gates
 from verdict.sandbox import SandboxConfig
+from verdict.sandbox.base import SandboxError
+from verdict.sandbox.cache import (
+    DEFAULT_CACHE_DIR,
+    cache_key,
+    compute_lockfile_hash,
+    load_gate_signals,
+    save_gate_signals,
+)
 from verdict.sandbox.config import create_sandbox
+from verdict.sandbox.install import run_setup_step
 from verdict.schema import (
     Attribution,
     AttributionKind,
@@ -39,6 +50,7 @@ from verdict.worktree import (
     Worktree,
     changed_files,
     commits_between,
+    copy_vendored_dependencies,
     parent_commit,
     scratch_worktree,
 )
@@ -78,10 +90,54 @@ def attribute_failures(
 def _reproduces_at(
     repo: Path, ref: str, gate: str, identity: str | None, sandbox_config: SandboxConfig
 ) -> Reproduction:
-    with scratch_worktree(repo, ref) as wt, create_sandbox(wt, sandbox_config) as sandbox:
-        return check_reproduces(
-            gate, identity, wt, sandbox=sandbox, timeout_seconds=sandbox_config.gate_timeout_seconds
-        )
+    """Phase 10: consults the base-state cache before rendering anything.
+    `ref` is always `worktree.base_commit` in practice — the one thing
+    that never changes across however many times this gets called in a
+    single `attribute_failures` run (once per failing signal being
+    attributed) — so a cache hit here is the common case after the first
+    call, not a rare one.
+
+    On a MISS, renders every gate at once (not just `gate`) and caches
+    the full set — the next failing signal's baseline check, whatever
+    gate it's against, then hits the cache too. Any failure along the way
+    (a `SandboxError`, or anything else genuinely unanticipated) degrades
+    to SKIP/untestable rather than raising — this baseline check has
+    always been resilient by design (a failed baseline check just means
+    "fall through to bisection," not "abort the attempt"), and Phase 10
+    doesn't change that.
+    """
+    lockfile_hash = compute_lockfile_hash(repo, ref)
+    key = cache_key(ref, lockfile_hash, sandbox_config.image)
+
+    cached = load_gate_signals(DEFAULT_CACHE_DIR, key)
+    if cached is not None and gate in cached:
+        return reproduction_from_signal(cached[gate], identity)
+
+    try:
+        with scratch_worktree(repo, ref) as wt:
+            copy_vendored_dependencies(repo, wt)
+            setup_env = run_setup_step(wt, sandbox_config)
+            config = load_config(wt)
+            with create_sandbox(wt, sandbox_config) as sandbox:
+                signals, _ = run_all_gates(
+                    wt,
+                    config,
+                    sandbox=sandbox,
+                    timeout_seconds=sandbox_config.gate_timeout_seconds,
+                    env=setup_env,
+                )
+    except SandboxError:
+        return Reproduction.SKIP
+    except Exception:
+        return Reproduction.SKIP
+
+    gate_signals = {signal.name: signal for signal in signals}
+    save_gate_signals(DEFAULT_CACHE_DIR, key, gate_signals)
+
+    target_signal = gate_signals.get(gate)
+    if target_signal is None:
+        return Reproduction.SKIP
+    return reproduction_from_signal(target_signal, identity)
 
 
 def _location(target: FailureLocation | None) -> str | None:

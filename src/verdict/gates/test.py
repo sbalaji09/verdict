@@ -36,13 +36,19 @@ class PytestRunner:
         return tests_dir.is_dir() and any(tests_dir.glob("test_*.py"))
 
     def run(
-        self, worktree: Path, sandbox: Sandbox | None = None, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+        self,
+        worktree: Path,
+        sandbox: Sandbox | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        env: dict[str, str] | None = None,
     ) -> Signal:
         fd, report_path = tempfile.mkstemp(suffix=".xml")
         os.close(fd)
         command = ["pytest", "-q", f"--junitxml={report_path}"]
         try:
-            result = exec_command(command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds)
+            result = exec_command(
+                command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds, env=env
+            )
             detail, status, failures = _parse_junit(report_path, fallback=result.stdout + result.stderr)
         finally:
             Path(report_path).unlink(missing_ok=True)
@@ -134,13 +140,19 @@ class JestRunner:
         return "jest" in dependencies or "jest" in dev_dependencies
 
     def run(
-        self, worktree: Path, sandbox: Sandbox | None = None, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+        self,
+        worktree: Path,
+        sandbox: Sandbox | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        env: dict[str, str] | None = None,
     ) -> Signal:
         fd, report_path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
         command = ["npx", "--no-install", "jest", "--json", f"--outputFile={report_path}"]
         try:
-            result = exec_command(command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds)
+            result = exec_command(
+                command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds, env=env
+            )
             detail, status, failures = _parse_jest(report_path, fallback=result.stdout + result.stderr)
         finally:
             Path(report_path).unlink(missing_ok=True)
@@ -197,10 +209,16 @@ class GoTestRunner:
         return (worktree / "go.mod").exists()
 
     def run(
-        self, worktree: Path, sandbox: Sandbox | None = None, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+        self,
+        worktree: Path,
+        sandbox: Sandbox | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        env: dict[str, str] | None = None,
     ) -> Signal:
         command = ["go", "test", "-json", "./..."]
-        result = exec_command(command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds)
+        result = exec_command(
+            command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds, env=env
+        )
         detail, status, failures = _parse_go_test(result.stdout, fallback=result.stdout + result.stderr)
 
         if status is None:
