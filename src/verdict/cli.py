@@ -36,6 +36,7 @@ from verdict.report_html import render_html
 from verdict.report_json import render_json
 from verdict.runner import grade_existing_diff, run_with_retries
 from verdict.sandbox import ResourceLimits, SandboxConfig
+from verdict.sandbox.base import SandboxUnavailableError
 from verdict.schema import ConfigResult, TaskRun
 from verdict.suite import BenchConfig, SuiteLoadError, load_suite, run_suite
 from verdict.worktree import WorktreeError
@@ -51,7 +52,14 @@ _SANDBOX_BACKEND_HELP = (
 
 
 def _build_sandbox_config(
-    sandbox_backend: str, sandbox_image: str, sandbox_cpus: float, sandbox_memory_mb: int
+    sandbox_backend: str,
+    sandbox_image: str,
+    sandbox_cpus: float,
+    sandbox_memory_mb: int,
+    gate_timeout_seconds: int,
+    provision_timeout_seconds: int,
+    install_timeout_seconds: int,
+    attempt_budget_seconds: int,
 ) -> SandboxConfig:
     if sandbox_backend not in ("docker", "local"):
         raise typer.BadParameter(f"unknown --sandbox-backend: {sandbox_backend!r} (choices: docker, local)")
@@ -59,6 +67,13 @@ def _build_sandbox_config(
         backend=sandbox_backend,  # type: ignore[arg-type]
         image=sandbox_image,
         limits=ResourceLimits(cpu_cores=sandbox_cpus, memory_mb=sandbox_memory_mb),
+        gate_timeout_seconds=gate_timeout_seconds,
+        provision_timeout_seconds=provision_timeout_seconds,
+        install_timeout_seconds=install_timeout_seconds,
+        # 0 means "no budget" at the CLI layer — Typer options can't carry
+        # a bare `None` from the command line, so 0 is the user-facing
+        # spelling of SandboxConfig.attempt_budget_seconds=None.
+        attempt_budget_seconds=attempt_budget_seconds if attempt_budget_seconds > 0 else None,
     )
 
 
@@ -88,8 +103,12 @@ _ADAPTER_ERRORS: tuple[type[Exception], ...] = (
 )
 
 # Combined with WorktreeError once here so both `run` and `bench` catch the
-# exact same set via a single, mypy-friendly tuple name.
-_RUN_ERRORS: tuple[type[Exception], ...] = (WorktreeError, *_ADAPTER_ERRORS)
+# exact same set via a single, mypy-friendly tuple name. SandboxUnavailableError
+# also covers its subclass ProvisioningTimeoutError (Phase 9) — a
+# provisioning timeout is deliberately handled exactly like every other
+# "this attempt couldn't be evaluated" cause already in this tuple: report
+# and exit 2, never a Signal. See DESIGN.md's Phase 9 section.
+_RUN_ERRORS: tuple[type[Exception], ...] = (WorktreeError, SandboxUnavailableError, *_ADAPTER_ERRORS)
 
 
 @app.callback()
@@ -260,6 +279,20 @@ def run_cmd(
     sandbox_memory_mb: int = typer.Option(
         2048, "--sandbox-memory-mb", help="Memory limit (MB) passed to DockerSandbox."
     ),
+    gate_timeout_seconds: int = typer.Option(
+        600, "--gate-timeout-seconds", help="Per-gate wall-clock timeout. A hang here is a real PROVEN FAIL."
+    ),
+    provision_timeout_seconds: int = typer.Option(
+        120, "--provision-timeout-seconds", help="How long DockerSandbox waits for `docker run` to come up."
+    ),
+    install_timeout_seconds: int = typer.Option(
+        300, "--install-timeout-seconds", help="Timeout for the dependency-install step."
+    ),
+    attempt_budget_seconds: int = typer.Option(
+        1800,
+        "--attempt-budget-seconds",
+        help="Global wall-clock ceiling across one whole attempt. 0 disables it.",
+    ),
 ) -> None:
     """Run an agent against one task (retrying on failure if --max-attempts > 1)
     and print its Verdict plus the cost across every attempt made.
@@ -269,7 +302,10 @@ def run_cmd(
     (see README's Configuration section).
     """
     adapter = _build_adapter(agent, repo)
-    sandbox_config = _build_sandbox_config(sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb)
+    sandbox_config = _build_sandbox_config(
+        sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb,
+        gate_timeout_seconds, provision_timeout_seconds, install_timeout_seconds, attempt_budget_seconds,
+    )
     try:
         task_run = run_with_retries(
             task=task, repo=repo, adapter=adapter, max_attempts=max_attempts, sandbox_config=sandbox_config
@@ -314,6 +350,20 @@ def bench_cmd(
     sandbox_memory_mb: int = typer.Option(
         2048, "--sandbox-memory-mb", help="Memory limit (MB) passed to DockerSandbox."
     ),
+    gate_timeout_seconds: int = typer.Option(
+        600, "--gate-timeout-seconds", help="Per-gate wall-clock timeout. A hang here is a real PROVEN FAIL."
+    ),
+    provision_timeout_seconds: int = typer.Option(
+        120, "--provision-timeout-seconds", help="How long DockerSandbox waits for `docker run` to come up."
+    ),
+    install_timeout_seconds: int = typer.Option(
+        300, "--install-timeout-seconds", help="Timeout for the dependency-install step."
+    ),
+    attempt_budget_seconds: int = typer.Option(
+        1800,
+        "--attempt-budget-seconds",
+        help="Global wall-clock ceiling across one whole attempt. 0 disables it.",
+    ),
 ) -> None:
     """Run every --agent against every task in --suite, then print a
     pass-rate-per-dollar leaderboard and a failure-mode breakdown.
@@ -328,7 +378,10 @@ def bench_cmd(
         raise typer.Exit(code=2) from exc
 
     configs = [BenchConfig(label=name, adapter=_build_bench_adapter(name)) for name in agent]
-    sandbox_config = _build_sandbox_config(sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb)
+    sandbox_config = _build_sandbox_config(
+        sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb,
+        gate_timeout_seconds, provision_timeout_seconds, install_timeout_seconds, attempt_budget_seconds,
+    )
 
     try:
         results = run_suite(tasks, configs, max_attempts=max_attempts, sandbox_config=sandbox_config)
@@ -363,6 +416,20 @@ def gate_cmd(
     sandbox_memory_mb: int = typer.Option(
         2048, "--sandbox-memory-mb", help="Memory limit (MB) passed to DockerSandbox."
     ),
+    gate_timeout_seconds: int = typer.Option(
+        600, "--gate-timeout-seconds", help="Per-gate wall-clock timeout. A hang here is a real PROVEN FAIL."
+    ),
+    provision_timeout_seconds: int = typer.Option(
+        120, "--provision-timeout-seconds", help="How long DockerSandbox waits for `docker run` to come up."
+    ),
+    install_timeout_seconds: int = typer.Option(
+        300, "--install-timeout-seconds", help="Timeout for the dependency-install step."
+    ),
+    attempt_budget_seconds: int = typer.Option(
+        1800,
+        "--attempt-budget-seconds",
+        help="Global wall-clock ceiling across one whole attempt. 0 disables it.",
+    ),
 ) -> None:
     """Grade `--repo` exactly as it's already checked out against `--base`
     — no adapter, no isolation. This is the merge-gate command: a pull
@@ -372,7 +439,10 @@ def gate_cmd(
     gate policy this enforces: any failing PROVEN signal fails the check;
     JUDGED signals never do.
     """
-    sandbox_config = _build_sandbox_config(sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb)
+    sandbox_config = _build_sandbox_config(
+        sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb,
+        gate_timeout_seconds, provision_timeout_seconds, install_timeout_seconds, attempt_budget_seconds,
+    )
     try:
         verdict = grade_existing_diff(repo=repo, base_ref=base, sandbox_config=sandbox_config)
     except WorktreeError as exc:
@@ -458,6 +528,20 @@ def flaky_cmd(
     sandbox_memory_mb: int = typer.Option(
         2048, "--sandbox-memory-mb", help="Memory limit (MB) passed to DockerSandbox."
     ),
+    gate_timeout_seconds: int = typer.Option(
+        600, "--gate-timeout-seconds", help="Per-gate wall-clock timeout. A hang here is a real PROVEN FAIL."
+    ),
+    provision_timeout_seconds: int = typer.Option(
+        120, "--provision-timeout-seconds", help="How long DockerSandbox waits for `docker run` to come up."
+    ),
+    install_timeout_seconds: int = typer.Option(
+        300, "--install-timeout-seconds", help="Timeout for the dependency-install step."
+    ),
+    attempt_budget_seconds: int = typer.Option(
+        1800,
+        "--attempt-budget-seconds",
+        help="Global wall-clock ceiling across one whole attempt. 0 disables it.",
+    ),
 ) -> None:
     """Run `--agent` on `--task` against `--repo` `--trials` independent
     times and report the pass rate with a Wilson confidence interval. With
@@ -470,7 +554,10 @@ def flaky_cmd(
     paid agent without budgeting for it.
     """
     adapter = _build_adapter(agent, repo)
-    sandbox_config = _build_sandbox_config(sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb)
+    sandbox_config = _build_sandbox_config(
+        sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb,
+        gate_timeout_seconds, provision_timeout_seconds, install_timeout_seconds, attempt_budget_seconds,
+    )
     try:
         result = run_flakiness(
             task=task, repo=repo, adapter=adapter, trials=trials, sandbox_config=sandbox_config

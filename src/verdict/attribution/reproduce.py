@@ -16,8 +16,10 @@ from enum import Enum
 from pathlib import Path
 
 from verdict.config import load_config
+from verdict.gates.base import DEFAULT_TIMEOUT_SECONDS
 from verdict.gates.registry import resolve_gate
 from verdict.sandbox import Sandbox
+from verdict.sandbox.base import SandboxError
 from verdict.schema import GateStatus
 
 
@@ -28,19 +30,33 @@ class Reproduction(str, Enum):
 
 
 def check_reproduces(
-    gate: str, target_identity: str | None, worktree: Path, sandbox: Sandbox | None = None
+    gate: str,
+    target_identity: str | None,
+    worktree: Path,
+    sandbox: Sandbox | None = None,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> Reproduction:
     """`target_identity` is a `FailureLocation.identity`, or None to check
     the gate as a whole (used for `build`, and for any gate whose original
     failure came from a `verdict.yml` override with no structured detail).
+
+    A gate that hangs here is graded exactly like any other bisection
+    check: `exec_command` maps the hang to exit 124, which resolves to a
+    normal FAIL/BAD verdict below, same as Phase 9's top-level gate runs.
+    Only genuine sandbox INFRASTRUCTURE failure (`SandboxError` — the
+    container itself couldn't be reached, as opposed to the command inside
+    it running long) is caught here and treated as SKIP/untestable, never
+    as evidence toward BAD.
     """
     try:
         config = load_config(worktree)
-        signal = resolve_gate(gate, worktree, config, sandbox=sandbox)
+        signal = resolve_gate(gate, worktree, config, sandbox=sandbox, timeout_seconds=timeout_seconds)
+    except SandboxError:
+        return Reproduction.SKIP
     except Exception:
-        # Anything we didn't anticipate (permissions, a tool crashing in a
-        # way exec_command's own guards don't cover) — treat as untestable
-        # rather than guessing which way it should count.
+        # Anything else we didn't anticipate (permissions, a tool crashing
+        # in a way exec_command's own guards don't cover) — treat as
+        # untestable rather than guessing which way it should count.
         return Reproduction.SKIP
 
     if signal.status is GateStatus.NA:

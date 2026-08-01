@@ -79,7 +79,9 @@ def _reproduces_at(
     repo: Path, ref: str, gate: str, identity: str | None, sandbox_config: SandboxConfig
 ) -> Reproduction:
     with scratch_worktree(repo, ref) as wt, create_sandbox(wt, sandbox_config) as sandbox:
-        return check_reproduces(gate, identity, wt, sandbox=sandbox)
+        return check_reproduces(
+            gate, identity, wt, sandbox=sandbox, timeout_seconds=sandbox_config.gate_timeout_seconds
+        )
 
 
 def _location(target: FailureLocation | None) -> str | None:

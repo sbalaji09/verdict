@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from verdict.gates.base import ToolRunner, exec_command, tail
+from verdict.gates.base import DEFAULT_TIMEOUT_SECONDS, ToolRunner, exec_command, tail
 from verdict.sandbox import Sandbox
 from verdict.schema import GateStatus, Provenance, Signal
 
@@ -40,9 +40,11 @@ class NpmBuildRunner:
             return False
         return "build" in data.get("scripts", {})
 
-    def run(self, worktree: Path, sandbox: Sandbox | None = None) -> Signal:
+    def run(
+        self, worktree: Path, sandbox: Sandbox | None = None, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+    ) -> Signal:
         command = ["npm", "run", "build", "--silent"]
-        result = exec_command(command, cwd=worktree, sandbox=sandbox)
+        result = exec_command(command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds)
         detail = tail(result.stdout + result.stderr)
         status = GateStatus.PASS if result.returncode == 0 else GateStatus.FAIL
         return Signal(

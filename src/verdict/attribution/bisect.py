@@ -25,6 +25,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from verdict.attribution.reproduce import Reproduction, check_reproduces
+from verdict.sandbox.base import SandboxError
 from verdict.sandbox.config import SandboxConfig, create_sandbox
 from verdict.worktree import WorktreeError, commits_between, scratch_worktree
 
@@ -40,8 +41,16 @@ def _check_at(
 ) -> Reproduction:
     try:
         with scratch_worktree(repo, sha) as wt, create_sandbox(wt, sandbox_config) as sandbox:
-            return check_reproduces(gate, identity, wt, sandbox=sandbox)
+            return check_reproduces(
+                gate, identity, wt, sandbox=sandbox, timeout_seconds=sandbox_config.gate_timeout_seconds
+            )
     except WorktreeError:
+        return Reproduction.SKIP
+    except SandboxError:
+        # Provisioning failed for this one candidate's scratch container —
+        # infra, not evidence either way. Same "untestable" treatment as a
+        # WorktreeError; the search's forward-nudge logic already handles
+        # a run of SKIPs.
         return Reproduction.SKIP
 
 

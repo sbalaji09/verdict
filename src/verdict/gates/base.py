@@ -33,7 +33,12 @@ class ToolRunner(Protocol):
         """
         ...
 
-    def run(self, worktree: Path, sandbox: Sandbox | None = None) -> Signal:
+    def run(
+        self,
+        worktree: Path,
+        sandbox: Sandbox | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    ) -> Signal:
         """Execute the tool and return a structured PROVEN Signal. Only
         called after `applicable` returned True, and only when no
         verdict.yml override exists for this gate — this method controls
@@ -41,6 +46,16 @@ class ToolRunner(Protocol):
         (--output-format=json and friends). `sandbox` is None only from
         call sites that haven't been threaded through explicitly (tests);
         real runs always pass one — see registry.py.
+
+        A hang here (`timeout_seconds` elapses) is graded exactly like any
+        other nonzero exit: a real PROVEN FAIL, never a special status —
+        see DESIGN.md's Phase 9 section for why an agent-introduced
+        infinite loop is treated as the agent's own defect, not
+        infrastructure. `exec_command` labels the FAIL's detail text with
+        "timed out after Ns" so the report reads honestly, but the
+        GateStatus itself needs no separate handling: `timeout_seconds`
+        elapsing produces exit code 124, which every parser below already
+        treats as a failure.
         """
         ...
 
@@ -58,8 +73,14 @@ def exec_command(
     don't need to change — only the execution underneath does.
     """
     result = (sandbox or fallback_sandbox()).exec(args, cwd=cwd, timeout_seconds=timeout_seconds)
+    stderr = result.stderr
+    if result.timed_out:
+        # Folded into stderr (not a separate field) so every existing
+        # parser's own fallback-to-tail(stdout+stderr) path already shows
+        # this without each gate file needing its own timeout branch.
+        stderr = (stderr + f"\ntimed out after {timeout_seconds}s").strip()
     return subprocess.CompletedProcess(
-        args=args, returncode=result.exit_code, stdout=result.stdout, stderr=result.stderr
+        args=args, returncode=result.exit_code, stdout=result.stdout, stderr=stderr
     )
 
 

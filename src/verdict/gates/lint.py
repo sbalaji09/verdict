@@ -12,7 +12,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from verdict.gates.base import ToolRunner, exec_command, tail
+from verdict.gates.base import DEFAULT_TIMEOUT_SECONDS, ToolRunner, exec_command, tail
 from verdict.sandbox import Sandbox
 from verdict.schema import FailureLocation, GateStatus, Provenance, Signal
 
@@ -72,10 +72,12 @@ class EslintRunner:
                 return True
         return False
 
-    def run(self, worktree: Path, sandbox: Sandbox | None = None) -> Signal:
+    def run(
+        self, worktree: Path, sandbox: Sandbox | None = None, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+    ) -> Signal:
         binary = str(worktree / "node_modules" / ".bin" / "eslint")
         command = [binary, ".", "-f", "json"]
-        result = exec_command(command, cwd=worktree, sandbox=sandbox)
+        result = exec_command(command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds)
         detail, status, failures = _parse_eslint(result)
         return Signal(
             name=self.gate,
@@ -123,9 +125,11 @@ class RuffRunner:
         pyproject = worktree / "pyproject.toml"
         return pyproject.exists() and "[tool.ruff" in pyproject.read_text(errors="ignore")
 
-    def run(self, worktree: Path, sandbox: Sandbox | None = None) -> Signal:
+    def run(
+        self, worktree: Path, sandbox: Sandbox | None = None, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+    ) -> Signal:
         command = ["ruff", "check", "--output-format=json", "."]
-        result = exec_command(command, cwd=worktree, sandbox=sandbox)
+        result = exec_command(command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds)
         detail, status, failures = _parse_ruff(result)
         return Signal(
             name=self.gate,

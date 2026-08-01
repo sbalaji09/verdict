@@ -4,6 +4,7 @@ adapter do the work, run the gates, assemble a Verdict.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from verdict.adapters import Adapter
@@ -11,9 +12,9 @@ from verdict.attribution.engine import attribute_failures
 from verdict.config import VerdictConfig, load_config
 from verdict.frontend.runner import run_frontend_checks
 from verdict.gates.registry import run_all_gates
-from verdict.sandbox import SandboxConfig, create_sandbox
+from verdict.sandbox import Sandbox, SandboxConfig, create_sandbox
 from verdict.sandbox.install import run_install_step
-from verdict.schema import AttemptResult, TaskRun, Verdict
+from verdict.schema import AttemptResult, Attribution, Signal, TaskRun, Verdict
 from verdict.worktree import (
     Worktree,
     commit_all,
@@ -25,6 +26,22 @@ from verdict.worktree import (
 )
 
 DEFAULT_MAX_ATTEMPTS = 1
+
+
+def _budget_deadline(sandbox_config: SandboxConfig) -> float | None:
+    """A `time.monotonic()` timestamp the global per-attempt budget
+    (Phase 9) expires at, or None if unset. Computed once, at the start of
+    an attempt — not re-derived per phase — so the budget is genuinely
+    global (adapter + install + every gate + attribution + frontend
+    combined), not an independent allowance per phase.
+    """
+    if sandbox_config.attempt_budget_seconds is None:
+        return None
+    return time.monotonic() + sandbox_config.attempt_budget_seconds
+
+
+def _budget_exceeded(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
 
 
 def run(
@@ -45,6 +62,8 @@ def run(
     (Phase 8's actual product default) via its `--sandbox-backend` flag.
     """
     sandbox_config = sandbox_config or SandboxConfig()
+    deadline = _budget_deadline(sandbox_config)
+
     with isolated_worktree(repo) as worktree:
         copy_vendored_dependencies(repo, worktree.path)
         run_install_step(worktree.path, sandbox_config)
@@ -63,8 +82,10 @@ def run(
 
             config = load_config(worktree.path)
             attempt = _apply_pricing_fallback(attempt, config)
-            signals = run_all_gates(worktree.path, config, sandbox=sandbox)
-            attributions = attribute_failures(repo, worktree, attempt_commit, signals, sandbox_config)
+
+            signals, attributions, budget_exceeded = _run_gates_and_attribution(
+                repo, worktree.path, worktree, attempt_commit, config, sandbox, sandbox_config, deadline
+            )
 
             # Frontend checks run after gates/attribution, and their signals are
             # appended afterward rather than folded into `signals` beforehand —
@@ -74,8 +95,10 @@ def run(
             # PROVEN evidence for Verdict.status either way; it's just not
             # (yet) bisectable to a culprit file the way test/typecheck/build/
             # lint failures are.
-            frontend_signals = run_frontend_checks(repo, worktree, config, task, sandbox=sandbox)
-            signals = signals + frontend_signals
+            if budget_exceeded or _budget_exceeded(deadline):
+                budget_exceeded = True
+            else:
+                signals = signals + run_frontend_checks(repo, worktree, config, task, sandbox=sandbox)
 
     return Verdict(
         task=task,
@@ -84,7 +107,43 @@ def run(
         attempt=attempt,
         signals=signals,
         attributions=attributions,
+        budget_exceeded=budget_exceeded,
     )
+
+
+def _run_gates_and_attribution(
+    repo: Path,
+    gate_worktree_path: Path,
+    attribution_worktree: Worktree,
+    final_commit: str,
+    config: VerdictConfig,
+    sandbox: Sandbox,
+    sandbox_config: SandboxConfig,
+    deadline: float | None,
+) -> tuple[list[Signal], list[Attribution], bool]:
+    """Shared by `run()` and `grade_existing_diff()`: run every gate (or
+    stop early at `deadline`), then attribute failures — but only if the
+    budget wasn't already exhausted, since bisection re-runs gates many
+    times over and starting it with no time left would just manufacture
+    more inconclusive/timed-out signals rather than a real answer.
+
+    `gate_worktree_path` and `attribution_worktree` are separate params
+    (rather than deriving one from the other) because `grade_existing_diff`
+    grades `repo` in place — its `Worktree.path` and the `repo` gates run
+    in are the same directory, but that's a coincidence of that mode, not
+    something this shared helper should assume.
+    """
+    signals, gates_budget_exceeded = run_all_gates(
+        gate_worktree_path,
+        config,
+        sandbox=sandbox,
+        timeout_seconds=sandbox_config.gate_timeout_seconds,
+        deadline=deadline,
+    )
+    if gates_budget_exceeded or _budget_exceeded(deadline):
+        return signals, [], True
+    attributions = attribute_failures(repo, attribution_worktree, final_commit, signals, sandbox_config)
+    return signals, attributions, False
 
 
 def grade_existing_diff(
@@ -122,14 +181,19 @@ def grade_existing_diff(
     # through this path itself.
     worktree = Worktree(path=repo, branch="HEAD", base_commit=base_commit)
     sandbox_config = sandbox_config or SandboxConfig()
+    deadline = _budget_deadline(sandbox_config)
 
     config = load_config(repo)
     with create_sandbox(repo, sandbox_config) as sandbox:
-        signals = run_all_gates(repo, config, sandbox=sandbox)
-        attributions = attribute_failures(repo, worktree, final_commit, signals, sandbox_config)
-        signals = signals + run_frontend_checks(
-            repo, worktree, config, task="pull request diff", sandbox=sandbox
+        signals, attributions, budget_exceeded = _run_gates_and_attribution(
+            repo, repo, worktree, final_commit, config, sandbox, sandbox_config, deadline
         )
+        if budget_exceeded or _budget_exceeded(deadline):
+            budget_exceeded = True
+        else:
+            signals = signals + run_frontend_checks(
+                repo, worktree, config, task="pull request diff", sandbox=sandbox
+            )
 
     return Verdict(
         task="grade existing diff",
@@ -138,6 +202,7 @@ def grade_existing_diff(
         attempt=attempt,
         signals=signals,
         attributions=attributions,
+        budget_exceeded=budget_exceeded,
     )
 
 

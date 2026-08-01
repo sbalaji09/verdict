@@ -173,6 +173,16 @@ class Verdict(BaseModel):
     signals: list[Signal]
     attributions: list[Attribution] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    budget_exceeded: bool = False
+    """Phase 9: True if the global per-attempt wall-clock budget
+    (`SandboxConfig.attempt_budget_seconds`) was hit before every gate
+    could even be attempted. `signals` in that case is a real but partial
+    list — gates that never got to run are simply absent from it, not
+    reported as FAIL (Verdict doesn't know they'd have failed) or NA (NA
+    means "this repo has no such stack," which isn't what happened). See
+    `status` below for how this affects DONE/NOT_DONE/UNVERIFIED, and
+    DESIGN.md's Phase 9 section for the full reasoning.
+    """
 
     def _proven_applicable(self) -> list[Signal]:
         return [
@@ -191,12 +201,21 @@ class Verdict(BaseModel):
         executable actually ran, the verdict is UNVERIFIED rather than a
         default DONE — "nothing failed" is not the same claim as "this
         works", and Verdict never lets the former masquerade as the latter.
+
+        A real PROVEN FAIL always wins, budget or not — an agent-caused
+        failure that was actually observed doesn't stop being real just
+        because the run later ran out of time elsewhere; it still counts
+        as NOT_DONE and still counts against the agent in metrics. But a
+        `budget_exceeded` run that saw no FAIL is never DONE either: gates
+        that never ran can't vouch for the ones that would have, so
+        "everything we managed to check passed" is downgraded to
+        UNVERIFIED rather than reported as a clean win.
         """
         applicable = self._proven_applicable()
-        if not applicable:
-            return VerdictStatus.UNVERIFIED
         if any(s.status is GateStatus.FAIL for s in applicable):
             return VerdictStatus.NOT_DONE
+        if not applicable or self.budget_exceeded:
+            return VerdictStatus.UNVERIFIED
         return VerdictStatus.DONE
 
     @computed_field  # type: ignore[prop-decorator]

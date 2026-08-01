@@ -22,7 +22,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from verdict.gates.base import ToolRunner, exec_command, tail
+from verdict.gates.base import DEFAULT_TIMEOUT_SECONDS, ToolRunner, exec_command, tail
 from verdict.sandbox import Sandbox
 from verdict.schema import FailureLocation, GateStatus, Provenance, Signal
 
@@ -63,10 +63,12 @@ class TscRunner:
             worktree / "node_modules" / ".bin" / "tsc"
         ).exists()
 
-    def run(self, worktree: Path, sandbox: Sandbox | None = None) -> Signal:
+    def run(
+        self, worktree: Path, sandbox: Sandbox | None = None, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+    ) -> Signal:
         binary = str(worktree / "node_modules" / ".bin" / "tsc")
         command = [binary, "--noEmit", "--pretty", "false"]
-        result = exec_command(command, cwd=worktree, sandbox=sandbox)
+        result = exec_command(command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds)
         detail, status, failures = _parse_tsc(result)
         return Signal(
             name=self.gate,
@@ -119,9 +121,11 @@ class MypyRunner:
         pyproject = worktree / "pyproject.toml"
         return pyproject.exists() and "[tool.mypy" in pyproject.read_text(errors="ignore")
 
-    def run(self, worktree: Path, sandbox: Sandbox | None = None) -> Signal:
+    def run(
+        self, worktree: Path, sandbox: Sandbox | None = None, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+    ) -> Signal:
         command = ["mypy", "--output", "json", "."]
-        result = exec_command(command, cwd=worktree, sandbox=sandbox)
+        result = exec_command(command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds)
         detail, status, failures = _parse_mypy(result)
         return Signal(
             name=self.gate,
