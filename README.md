@@ -120,17 +120,22 @@ Block a merge when an agent's own work doesn't pass — proven checks are requir
 # .github/workflows/verdict.yml
 name: verdict-gate
 on: [pull_request]
+permissions:
+  contents: read
+  pull-requests: write   # only needed for the advisory judged-signal comment
 jobs:
   verdict:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # bisection/attribution needs the PR's base ref history
       - uses: verdict-ai/action@v1
         with:
-          require: proven          # fail the check on any failing proven signal
-          advisory: judged         # post judged scores as a PR comment, don't block
-          frontend: true           # spin up the app and verify the UI
+          install-frontend-extra: true   # only if verdict.yml configures frontend checks
 ```
+
+Any failing PROVEN signal (test/typecheck/build/lint/frontend) fails the check — that's the whole gate policy, and it isn't configurable per-repo (see DESIGN.md's Phase 6 section for why). JUDGED signals never affect the check; they're posted as a separate, advisory PR comment.
 
 ## Supported agents
 
@@ -166,10 +171,9 @@ frontend:
 
 cost:
   price_per_1k_tokens: { input: 0.003, output: 0.015 }
-
-report:
-  format: [cli, json, html]       # html dashboard for CI artifacts
 ```
+
+Report format is a CLI flag, not a `verdict.yml` key: `--report cli --report json --report html --output-dir verdict-report` (repeatable; any combination). `json`/`html` write `verdict-report.json`/`verdict-report.html` — the HTML file is a single, self-contained dashboard (inline CSS/JS, no external requests) suitable as a CI artifact.
 
 ## Benchmark suites
 

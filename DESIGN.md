@@ -1454,3 +1454,270 @@ zeros.
   correct." A real integration pass against each installed CLI is future
   work, not something a sandboxed test run can honestly claim to have
   done.
+
+---
+
+## Phase 6 — Merge Gate & Reports
+
+## The goal, restated
+
+Every phase through Phase 5 answers "is this agent's attempt correct" for
+someone running Verdict by hand or reading a scorecard. Phase 6 puts
+Verdict where the brief's own README already said it belongs: "drops into
+CI as a merge gate that blocks an agent's PR when the agent's own work
+doesn't pass." That's two separable things, built as two separable
+pieces — a way to grade a PR that already exists (no agent to drive), and
+a way to hand the result to a human or a CI system in a form each can
+actually use (a terminal, a script, a browser). Neither piece needed a new
+trust model: the gate's pass/fail is still exactly `Verdict.status`, and
+every reporter renders the exact same PROVEN/JUDGED-tagged data every
+earlier phase already produces.
+
+## Grading a PR that already exists: no adapter, no isolation
+
+Every phase through Phase 5 assumed the shape "hand an agent a task, let
+it produce a diff, grade the diff" — `run()`/`run_with_retries()` isolate
+a fresh worktree specifically because there's an *agent* about to mutate
+it. A pull request breaks that assumption in a way that's actually
+simplifying, not complicating: **the diff already exists, as real commits,
+before Verdict ever runs.** There's no task to hand anyone and nothing to
+isolate — the CI runner's own checkout already *is* the thing to grade.
+`runner.py::grade_existing_diff(repo, base_ref)` is the new entry point
+built for exactly this:
+
+```python
+def grade_existing_diff(repo: Path, base_ref: str) -> Verdict:
+    base_commit = rev_parse(repo, base_ref)
+    final_commit = rev_parse(repo, "HEAD")
+    diff, files_changed = diff_between(repo, base_commit, final_commit)
+    attempt = AttemptResult(diff=diff, files_changed=files_changed, cost_usd=None)
+
+    worktree = Worktree(path=repo, branch="HEAD", base_commit=base_commit)
+    config = load_config(repo)
+    signals = run_all_gates(repo, config)
+    attributions = attribute_failures(repo, worktree, final_commit, signals)
+    signals = signals + run_frontend_checks(repo, worktree, config, task="pull request diff")
+
+    return Verdict(task="grade existing diff", agent="gate", repo=str(repo),
+                    attempt=attempt, signals=signals, attributions=attributions)
+```
+
+Three things worth calling out, none of which needed new machinery:
+
+- **`Worktree` is reused as a plain value, not constructed via
+  `isolated_worktree()`.** `Worktree` was already just a dataclass
+  (`path`, `branch`, `base_commit`) — nothing stops building one that
+  points straight at the real checkout instead of a throwaway copy.
+  `attribute_failures` only ever *reads* `worktree.path` (for the
+  dependency-graph scan) and `worktree.base_commit` (bisection's starting
+  point); it never writes through this reference itself.
+- **Bisection is safe against the real checkout because it always was.**
+  Re-reading `attribution/bisect.py`: `run_bisect` runs `git bisect`
+  entirely inside its own `scratch_worktree(repo, bad_sha)` — a disposable
+  detached worktree — and `repo` is only ever used as the *source* for
+  `git worktree add --detach`, which doesn't touch `repo`'s own HEAD or
+  index. This was already true in every earlier phase (`repo` passed to
+  `attribute_failures` in `runner.run()` is the original source repo, not
+  the throwaway worktree); Phase 6 just relies on a property Phase 2
+  already had to get right.
+- **`diff_between` (new, in `worktree.py`) is read-only where
+  `diff_against_base` isn't.** `diff_against_base` calls `git add -A`
+  before diffing, because Phase 0 needed to capture an agent's
+  *uncommitted* edits in a worktree Verdict owns. Grading an existing PR
+  has nothing uncommitted to catch — `HEAD` already is the final state —
+  so `diff_between` runs a plain `git diff base final` and never stages
+  anything. Staging in a CI runner's own checkout would be a real,
+  unwanted side effect for a mode whose entire point is "grade the repo
+  as found." Verified directly in `test_worktree.py`: `git status
+  --porcelain` is asserted identical before and after the call.
+
+`AttemptResult.cost_usd` is `None`, not `0` — this diff wasn't produced by
+an adapter Verdict drove, so "what it cost" is a question this mode simply
+doesn't answer, and `0` would look like a real, known figure where
+`Verdict`'s whole schema discipline (Phase 3) says an unknown should never
+impersonate a known zero.
+
+## The gate policy
+
+`verdict gate --repo . --base <ref>` exits non-zero exactly when
+`Verdict.status` is not `DONE` — i.e. exactly the same rule `verdict run`
+already used for its exit code, applied to a `Verdict` this mode computed
+differently. Restated because it's the one policy the whole phase exists
+to enforce: **any failing PROVEN signal fails the check.** Test, typecheck,
+build, lint, DOM assertion, interaction drive, perceptual screenshot diff,
+glitch scan — every one of them is load-bearing, none of them softer than
+another. `UNVERIFIED` (zero PROVEN gates ran at all) also fails the check,
+for the same reason it's not-done everywhere else in this schema: a check
+that verified nothing has no basis to wave a PR through.
+
+**JUDGED signals never fail the check, and never appear in its exit code
+at all.** They're surfaced a structurally different way — an advisory PR
+comment (`verdict pr-comment`, driven by `action.yml`) — specifically so
+there's no code path where a vision-model opinion could accidentally
+become load-bearing by sharing a decision point with PROVEN signals. This
+is the same policy `Verdict.status` has enforced since Phase 0, made
+visible at the CI-integration layer: the *check* (pass/fail, blocks
+merging) and the *comment* (opinion, informational) are two separate
+GitHub API objects, populated by two separate action steps, so there is no
+single flag or threshold that could quietly let a glowing JUDGED score
+compensate for a failing PROVEN one, or vice versa.
+
+## Reporters: one shape, three renderers
+
+`report_json.py` and `report_html.py` both consume exactly
+`list[ConfigResult]` — the same shape `bench`'s leaderboard already
+produces (Phase 5), and the same shape `run`/`gate` produce once wrapped
+as a single-config, single-task list. One shape, three renderers (`cli`
+via `report.py`/`economics.py`, `json`, `html`) means the three can never
+disagree about what happened — they're views over the same object graph,
+not three independent tallies that could drift.
+
+**Turning `Verdict.status`/`done`/`confidence` (and the `TaskRun`/
+`ConfigResult` aggregate properties) into `@computed_field @property`
+instead of plain `@property` was the one real schema change this phase
+needed**, caught by actually trying to serialize a report rather than by
+inspecting the schema on paper: Pydantic's `model_dump`/`model_dump_json`
+silently omit plain `@property` values, so the very first `verdict-report.json`
+this phase produced was missing `status`/`done`/`pass_rate_per_dollar`
+entirely — every number a consumer (a CI script, `pr-comment`, a future
+dashboard) would actually want. Marking them `@computed_field` is purely
+additive (every existing field, every existing in-Python access pattern
+via `verdict.status` is unchanged) and closes the gap once, at the schema
+level, rather than having `report_json.py` hand-reconstruct
+`Verdict.status`'s PROVEN-only logic itself — which would have been
+exactly the kind of duplicated trust-decision logic this whole codebase
+has avoided since Phase 0.
+
+**Why JSON is nearly a one-liner.** `Verdict`/`TaskRun`/`ConfigResult` have
+been Pydantic models since Phase 0 — `report_json.py` doesn't reshape
+anything, it wraps `[cr.model_dump(mode="json") for cr in config_results]`
+in a small `{"schema_version": 1, "configs": [...]}` envelope so every
+consumer has one stable top-level shape to parse regardless of which
+command produced the report.
+
+**The HTML dashboard is one self-contained file — inline CSS, inline JS,
+no external request of any kind** (no CDN script, no Google Font, no
+separate stylesheet). Three sections: a leaderboard (reusing
+`economics.rank`'s ordering, so the HTML and CLI leaderboards can never
+disagree about who's ranked where), a failure-mode breakdown (reusing
+`failure_modes.summarize_failure_modes` for the same reason), and one
+collapsible card per task run showing its PROVEN/JUDGED signals (visually
+distinguished — JUDGED gets a dashed border and an "opinion" badge, and
+never changes a card's pass/fail color, which comes from `Verdict.status`
+alone), its causal analysis, and its cost. The one inline script is a
+single "show only failing tasks" checkbox — genuinely useful for a CI
+artifact with many tasks, and the only interactivity that felt worth the
+one script tag rather than none. **All interpolated text is HTML-escaped**
+(`html.escape`, not manual string replacement) — a task description or a
+signal's `detail` can contain anything an agent wrote, including literal
+`<script>` tags in a prompt or a stack trace, and none of that is trusted
+markup. Verified directly in `test_reporters.py`: a task string containing
+`<script>alert(1)</script>` renders as the escaped `&lt;script&gt;...`,
+never as live markup.
+
+## The GitHub Action
+
+`action.yml` is a composite action (`verdict-ai/action` is what it's
+published as) with one job: install Verdict, run the gate, upload the
+full report as a CI artifact, post the advisory comment, then fail the
+job if the gate failed. The awkward-looking bracket around one step —
+
+```bash
+set +e
+verdict gate ...
+code=$?
+set -e
+echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+```
+
+— exists because composite-action `run:` steps execute under `bash -e`;
+without disabling it around exactly this one command, the script would
+abort the instant `verdict gate` exits non-zero and never reach the line
+that records the exit code for the later "fail the check" step to use.
+`continue-on-error: true` on the same step keeps *that* failure from
+ending the job immediately — the artifact upload and PR-comment steps
+below it (`if: always()`) still need to run even when the gate failed, and
+a final step explicitly re-raises the captured exit code once everything
+else has run. This is the standard idiom for "run cleanup/reporting steps
+after a failing step, but still fail the job overall" — not a workaround,
+a normal composite-action pattern once GitHub Actions' step semantics are
+taken into account.
+
+**`verdict pr-comment <report.json>` is its own CLI command, not a
+standalone script bundled with the action**, so the comment-body logic
+(`pr_comment.py::build_comment`) is versioned, tested, and installed
+alongside the rest of Verdict rather than living as an untested shell
+script the action happens to carry. The action's own comment-posting step
+is deliberately thin — `gh pr comment --edit-last --body-file ... || gh pr
+comment --body-file ...` — because `gh` (preinstalled on every
+GitHub-hosted runner) already does comment upsert correctly; hand-rolling
+a GitHub REST API call here would mean a network client this package
+doesn't otherwise need, for something a two-line shell idiom already
+does better. `--edit-last` means a repeatedly-pushed PR accumulates one
+updated comment, not a growing pile of stale ones.
+
+**`install-frontend-extra` is opt-in, not automatic.** Installing
+Playwright's Chromium browser costs real setup time on every single CI
+run; most repos don't configure `frontend:` checks in `verdict.yml` at
+all, so paying that cost by default would slow down every gate run to
+benefit only the ones that need it. A repo that does configure frontend
+checks sets `install-frontend-extra: true` once in its workflow file.
+
+## End-to-end verification
+
+`tests/test_gate.py` is the closest thing to "run the action" available
+without real GitHub infrastructure to drive (no live PR, no `gh` CLI
+authenticated against a real repo, in this environment). Two levels:
+
+- **Unit-level**, against synthetic repos built the same way
+  `test_worktree.py`/`test_runner.py` already do: a PR that fixes the
+  seeded bug grades `DONE`; a PR that changes something unrelated grades
+  `NOT_DONE` and attributes the failure `PRE_EXISTING`; a PR whose *first*
+  of two real commits fixes the bug and whose *second* reintroduces it
+  exercises real bisection (not just "blame the only changed commit") and
+  attributes `REGRESSION` to the right file.
+- **End-to-end against the real `examples/sample_repo`** — not a synthetic
+  fixture, the actual checked-in example: bootstrap it via its own
+  `setup.sh` (idempotent, same as a CI workflow's own setup step would
+  do), copy it to a scratch directory so the checked-in example is never
+  mutated, commit a real fix as a second commit standing in for a PR's own
+  commits, then drive the *exact* `verdict gate` CLI invocation
+  `action.yml`'s `run:` step uses (via `typer.testing.CliRunner`, not a
+  hand-called Python function) — asserting the process exit code, the
+  written `verdict-report.json`'s `done`/`status` fields, and that the
+  HTML report file exists. A second test runs the same real example with
+  an irrelevant change instead of a fix and asserts exit code `1`. This is
+  the full path from "a real example repo" to "CLI exit code a CI job
+  would act on," the same standard Phase 2's attribution tests held
+  themselves to for real `git bisect` rather than mocking it.
+
+## What's explicitly out of scope for Phase 6
+
+- **No real GitHub Actions runner exercised the action itself** — no live
+  PR, no real `gh pr comment` call, no real `GITHUB_TOKEN`. `action.yml`'s
+  YAML structure and the exact shell idioms it depends on
+  (`continue-on-error` + captured exit code, `gh pr comment --edit-last`)
+  are standard, well-documented patterns, but "standard pattern, carefully
+  reasoned through" is not the same claim as "verified against a real
+  workflow run" — matching the same honesty Phase 5 already applied to its
+  four adapters' CLI invocations.
+- **No comment deduplication beyond `gh pr comment --edit-last`** — this
+  matches by *author*, not by the `MARKER` comment embeds. A repo where
+  some other tool or bot also comments as the same identity could see
+  `--edit-last` overwrite the wrong comment; out of scope to build a
+  full search-by-marker upsert (a `gh api` + `jq` round trip) for a
+  concern that doesn't arise from the action's own single-identity use.
+- **No configurable gate policy** — "any failing PROVEN signal fails the
+  check" is not adjustable per-repo (no "allow N failures," no per-gate
+  severity levels). This is a deliberate reflection of the project's core
+  thesis, not an oversight: a configurable threshold is exactly the kind
+  of knob that quietly turns "proven" into "proven, unless we didn't feel
+  like blocking on it."
+- **No historical trend view across gate runs** — each `verdict gate`
+  invocation is independent; nothing is persisted for comparing today's
+  PR against yesterday's. Same scope line Phase 5 already drew for
+  `bench`.
+- **The HTML dashboard has no server-side or client-side data fetching**
+  — it's rendered once, fully, at report-generation time. A dashboard that
+  updates live or pulls from an API is a different kind of artifact than
+  "a single file `actions/upload-artifact` can attach to a run."
