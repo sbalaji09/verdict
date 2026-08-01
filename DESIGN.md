@@ -1918,3 +1918,202 @@ itself to.
 - **Only three confidence levels are supported** (90/95/99%) — see the
   Wilson interval section above for why an arbitrary level isn't worth the
   normal-quantile approximation it would require.
+
+## Phase 8 — Sandboxed Execution
+
+## The problem, restated
+
+Phase 0 flagged this and deferred it explicitly: *"no container, no
+network sandboxing, no filesystem jail... containerized sandboxing is a
+separate, later concern once there's something worth sandboxing more
+tightly."* Seven phases later, there's a lot worth sandboxing more
+tightly: every gate tool, every coding-agent CLI (`adapters/*.py`), the
+frontend dev server, and attribution's bisection re-runs all execute
+code that either comes directly from an untrusted repo/PR or was just
+written by an autonomous agent — with this process's own filesystem
+access, network reachability, and (before this phase) full host
+environment, `os.environ` included. That's the single biggest gap in the
+product's own trust model: Verdict's whole premise is grading *untrusted*
+code by executing it, and until this phase, "executing it" meant running
+it with Verdict's own privileges.
+
+## Threat model
+
+| Untrusted input | What could go wrong | Control |
+|---|---|---|
+| Agent-authored test/build/lint code (`gates/*.py`) | Reads Verdict's own env (API keys passed to adapters), writes/deletes outside the worktree, reaches the network | `Sandbox.exec()`: explicit-only `env`, `--read-only` rootfs + worktree-only writable mount, `--network none` by default |
+| A `verdict.yml` gate override / `frontend.start` (shell string sourced from the repo being graded) | Host `shell=True` — arbitrary shell injection with host privileges | Wrapped as `["sh", "-c", command]` and executed *inside* the sandbox — the shell boundary moved, not removed |
+| A coding agent's own CLI (`adapters/*.py`) | Same privileges as gates, plus it's the process actually producing the code gates later execute | Routed through the same `Sandbox.exec()` chokepoint — no adapter calls `subprocess` directly anymore |
+| The frontend dev server (agent-authored server code) | Binds ports, can fork children that outlive naive teardown, executes arbitrary server-side logic | Runs via `Sandbox.exec_background()`; a container's whole process tree dies with it — no `os.killpg` process-group bookkeeping needed |
+| Historical commits re-checked-out during bisection | Same as gates, at N different commits instead of one | `attribution/bisect.py`'s self-driven binary search calls one fresh `Sandbox.exec()` per candidate commit — see below |
+| Agent-authored HTML/JS the frontend dev server serves | Arbitrary JS executes in Playwright's Chromium renderer | **Not closed by Phase 8** — see "known gap" below |
+
+## The `Sandbox` abstraction
+
+One Protocol (`sandbox/base.py`), two implementations:
+
+```python
+class Sandbox(Protocol):
+    def exec(self, cmd, cwd, env=None, timeout_seconds=600,
+              limits=None, network=False) -> ExecResult: ...
+    def exec_background(self, cmd, cwd, env=None, network=False) -> BackgroundHandle: ...
+    def __enter__(self) -> "Sandbox": ...
+    def __exit__(self, *exc) -> None: ...
+```
+
+`cmd` is always an argv list, never a shell string — a caller holding a
+shell command from an untrusted source (`verdict.yml`, `frontend.start`)
+wraps it as `["sh", "-c", command]` itself, so the shell interpretation
+happens *inside* whichever backend is active, never via a host
+`shell=True`. `env` is the *complete* set of extra variables a process
+sees, merged with a small fixed baseline — never the caller's full
+`os.environ` — so an adapter that genuinely needs a secret (an API key)
+must name it explicitly; nothing is inherited implicitly, on either
+backend.
+
+**`DockerSandbox`** (the default): one container per `with` block, bound
+to one worktree, `docker rm -f`'d unconditionally on exit. `--network
+none` unless a caller asks for `network=True` (only the install step and
+the dev server do); `--read-only` rootfs with the worktree bind-mounted
+read-write and `/tmp` a small tmpfs, so an agent can edit its own checkout
+freely but can't write anywhere else in the container. CPU/memory/pids
+limits are passed to `docker run` today; *enforcement quality* (OOM
+detection, a `killed_reason` beyond `"timeout"`) is Phase 9, not this
+phase — the `ResourceLimits` fields exist now so call sites don't need to
+change again when that lands.
+
+**`LocalSandbox`** (opt-in only): today's pre-Phase-8 behavior — direct
+subprocess execution, no isolation — behind the same interface, so
+swapping backends is a config change, never a code change. Constructing
+one prints, once, a loud:
+
+```text
+⚠️  UNSAFE — no isolation. Agent-generated code will execute with this
+    process's full privileges (filesystem, network, credentials). Use
+    only for local development on trusted repos.
+```
+
+It's the library-level *default* (`SandboxConfig()`, unqualified) — so
+embedding code and tests don't silently require a Docker daemon — but the
+`verdict` CLI itself defaults `--sandbox-backend` to `docker`, which is
+the actual product default this phase is about.
+
+**Sandbox settings never come from the repo being graded.** `SandboxConfig`
+is constructed from Verdict's own CLI flags (`--sandbox-backend`,
+`--sandbox-image`, `--sandbox-cpus`, `--sandbox-memory-mb`), never parsed
+out of `verdict.yml` the way `gate_overrides`/`frontend` are — an
+untrusted PR shipping a `verdict.yml` must never be able to turn off its
+own sandbox.
+
+## Base image: one fat, pinned image
+
+`Dockerfile` (repo root) builds a single multi-language image — Python
+(via `pyenv`), Node (via `nvm`), Go, and Playwright's Chromium — rather
+than per-language images selected at runtime. Tradeoff, decided up front
+rather than discovered mid-implementation:
+
+- **Bake, don't mount.** A thin base image with host toolchains bind-
+  mounted in was rejected: it reintroduces a host-trust dependency
+  (whatever's installed on whichever machine runs Verdict) this phase
+  exists to remove, and creates version drift between dev machines that a
+  baked image doesn't have.
+- **One fat image over several slim ones**, for now: simpler to build,
+  test, and reason about with one image; a polyglot repo (Node frontend +
+  Go backend) needs only one container, not a coordination story across
+  several. The tradeoff is a larger pull (~2-3GB) and one team owning
+  every language's version currency. `SandboxConfig.image` is a config
+  field, not a hardcoded name, specifically so a future per-language
+  selection strategy is a config change, not a refactor.
+- **Version managers are baked in, unused so far.** `pyenv`/`nvm` are
+  installed so a *later* phase can resolve a repo's own `.python-version`/
+  `.nvmrc` pin instead of silently running against whatever the image's
+  default happens to be — Phase 8 installs the managers and one default
+  interpreter of each; it does not yet read or honor a repo's pin. A repo
+  that pins Node 18 while the image defaults to Node 20 is a known,
+  explicit gap, not something silently misattributed to the agent.
+- **Pinned by tag, not yet by digest.** `verdict-sandbox:0.1.0` (not
+  `:latest`) is referenced by version, so a given Verdict release always
+  grades against the same toolchain — reproducible verdicts across image
+  rebuilds. Digest pinning is strictly stronger (a tag can technically be
+  overwritten) and is a follow-up hardening step, not done here.
+
+## The network-policy boundary: install vs. gates
+
+Before this phase, Verdict never ran a real dependency install — repos
+were expected to pre-vendor `node_modules` (`worktree.py`'s
+`copy_vendored_dependencies`). That's still the primary path. Phase 8
+adds a minimal, explicitly scoped exception: `sandbox/install.py` detects
+an install command (only when the dependency directory looks genuinely
+absent — `package.json` with no `node_modules`, etc.) and runs it with
+`network=True`, in its **own** sandbox session, separate from the one
+gates run in. Gates' sandbox session stays `network=False` for the entire
+run, full stop — the two never share a container, because Docker fixes a
+container's network mode at creation time, and letting the install step's
+network-on session "leak" into the gate-running session would silently
+widen the boundary this phase exists to draw.
+
+Deliberately out of scope, deferred to **Phase 10**: broader install-
+command autodetection, dependency caching across runs, resolving a repo's
+pinned language version via the now-present `pyenv`/`nvm`, and service
+dependencies (databases, etc.). A test
+(`tests/test_sandbox_docker_adversarial.py`) proves the boundary itself:
+gates cannot reach the network under any circumstance; the install step
+can.
+
+## Bisection: a self-driven binary search, not `git bisect run`
+
+The old `attribution/bisect.py` shelled out to `git bisect run <cmd>`,
+where **git itself** repeatedly checked out a candidate commit and
+re-invoked `bisect_cli.py` as a fresh **host** subprocess at each one — a
+nested subprocess-of-a-subprocess Verdict couldn't route through a
+`Sandbox` individually; the most it could sandbox was the outer `git
+bisect` call, not each individual check.
+
+Phase 8 rewrote `run_bisect` to drive its own binary search over
+`commits_between(repo, good_sha, bad_sha)` (with a bounded forward nudge
+past `SKIP` results, mirroring `git bisect skip`'s own heuristic), so
+every candidate commit's check is one `Sandbox.exec()` call this module
+controls directly. `bisect_cli.py` — which existed only to be invoked *by*
+`git bisect run` — is gone; nothing else called it.
+
+This was scoped as a "how it executes" change, not a "what it concludes"
+change: the existing two-level design (commit-level bisect, then a
+synthetic per-file ladder — `attribution/synth.py`, untouched) is
+unchanged, and every existing Phase 2 attribution fixture
+(`tests/test_attribution.py`) still passes unmodified, proving the
+rewritten search converges on the same culprit commit/file a real `git
+bisect` would have found. A sandbox infra failure mid-search (a
+`SandboxUnavailableError`, a Docker daemon hiccup) maps to `Reproduction.
+SKIP` via `check_reproduces`'s existing exception handling — the same
+taxonomy `bisect_cli.py`'s exit codes used to drive — so an infra blip
+can't be misread as "this commit is the culprit."
+
+## Known gap: the browser isn't sandboxed
+
+The dev server itself now runs inside a `Sandbox` (`frontend/server.py`),
+but Playwright's Chromium (`frontend/runner.py`) still launches directly
+on the host and reaches the dev server the same way it always has. Since
+the page served is entirely agent-authored HTML/JS, and that JS executes
+in this host-side renderer, this remains real, unsandboxed execution of
+untrusted code — the single highest-risk surface flagged during this
+phase's design review. Closing it (e.g. running Playwright's own
+remote-server mode inside the same container as the dev server, with the
+host driving it over CDP) is real, scoped work of its own and is not
+implemented here; `frontend/runner.py::run_frontend_checks`'s docstring
+carries the same note inline.
+
+## What's explicitly out of scope for Phase 8
+
+- **CPU/memory/pids enforcement quality** — limits are passed to `docker
+  run`, but OOM detection and a `killed_reason` beyond `"timeout"` don't
+  exist yet. **Phase 9.**
+- **Network allowlisting beyond off/on** — `SandboxConfig` has no
+  per-host allowlist; a sandbox session can reach nothing or everything
+  on its network, no middle ground. **Phase 9.**
+- **Digest-pinning the base image**, install-command breadth, dependency
+  caching, language-version pin resolution, and service dependencies —
+  see the sections above. **Phase 9/10, as noted per item.**
+- **Sandboxing the Playwright browser itself** — see "known gap" above.
+- **Multi-repo/multi-tenant resource isolation** — this phase's unit is
+  one worktree, one container; nothing here addresses running many
+  untrusted repos' sandboxes concurrently on shared infrastructure.
