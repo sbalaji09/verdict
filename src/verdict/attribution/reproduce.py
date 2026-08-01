@@ -20,13 +20,36 @@ from verdict.gates.base import DEFAULT_TIMEOUT_SECONDS
 from verdict.gates.registry import resolve_gate
 from verdict.sandbox import Sandbox
 from verdict.sandbox.base import SandboxError
-from verdict.schema import GateStatus
+from verdict.schema import GateStatus, Signal
 
 
 class Reproduction(str, Enum):
     GOOD = "good"   # the target failure does NOT reproduce here
     BAD = "bad"     # the target failure DOES reproduce here
     SKIP = "skip"   # untestable state — don't let bisection draw a conclusion
+
+
+def reproduction_from_signal(signal: Signal, target_identity: str | None) -> Reproduction:
+    """The pure, signal-only half of `check_reproduces` — split out so
+    Phase 10's base-state cache (`attribution/engine.py::_reproduces_at`)
+    can reuse this exact logic against a *cached* Signal on a cache hit,
+    without re-deriving it or re-running anything.
+    """
+    if signal.status is GateStatus.NA:
+        # this gate's stack isn't even present at this state — can't tell
+        return Reproduction.SKIP
+
+    if target_identity is None:
+        return Reproduction.BAD if signal.status is GateStatus.FAIL else Reproduction.GOOD
+
+    if signal.status is GateStatus.FAIL and not signal.failures:
+        # failed, but with no structured failure list to check identity
+        # against (e.g. a verdict.yml override) — can't confirm it's the
+        # *same* failure, only that *something* failed.
+        return Reproduction.SKIP
+
+    ids = {f.identity for f in signal.failures}
+    return Reproduction.BAD if target_identity in ids else Reproduction.GOOD
 
 
 def check_reproduces(
@@ -59,18 +82,4 @@ def check_reproduces(
         # untestable rather than guessing which way it should count.
         return Reproduction.SKIP
 
-    if signal.status is GateStatus.NA:
-        # this gate's stack isn't even present at this state — can't tell
-        return Reproduction.SKIP
-
-    if target_identity is None:
-        return Reproduction.BAD if signal.status is GateStatus.FAIL else Reproduction.GOOD
-
-    if signal.status is GateStatus.FAIL and not signal.failures:
-        # failed, but with no structured failure list to check identity
-        # against (e.g. a verdict.yml override) — can't confirm it's the
-        # *same* failure, only that *something* failed.
-        return Reproduction.SKIP
-
-    ids = {f.identity for f in signal.failures}
-    return Reproduction.BAD if target_identity in ids else Reproduction.GOOD
+    return reproduction_from_signal(signal, target_identity)

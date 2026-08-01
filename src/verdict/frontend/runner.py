@@ -38,7 +38,14 @@ from verdict.frontend.glitch import GlitchScanResult, scan_for_glitches
 from verdict.frontend.server import FrontendServerError, dev_server
 from verdict.frontend.vision_judge import MockVisionJudge, VisionJudge, to_signal
 from verdict.frontend.visual_diff import perceptual_diff_ratio
-from verdict.sandbox import Sandbox
+from verdict.sandbox import Sandbox, SandboxConfig
+from verdict.sandbox.cache import (
+    DEFAULT_CACHE_DIR,
+    cache_key,
+    compute_lockfile_hash,
+    load_screenshots,
+    save_screenshots,
+)
 from verdict.sandbox.config import fallback_sandbox
 from verdict.schema import GateStatus, Provenance, Signal
 from verdict.worktree import Worktree, copy_vendored_dependencies, scratch_worktree
@@ -68,6 +75,7 @@ def run_frontend_checks(
     task: str,
     vision_judge: VisionJudge | None = None,
     sandbox: Sandbox | None = None,
+    sandbox_config: SandboxConfig | None = None,
 ) -> list[Signal]:
     """Empty list if `verdict.yml` has no `frontend:` section — frontend
     checks are entirely opt-in, same as the gate overrides they sit
@@ -87,6 +95,7 @@ def run_frontend_checks(
     if frontend is None:
         return []
     sandbox = sandbox or fallback_sandbox()
+    sandbox_config = sandbox_config or SandboxConfig()
 
     if sync_playwright is None:
         return [
@@ -112,7 +121,9 @@ def run_frontend_checks(
         with sync_playwright() as pw:
             browser = pw.chromium.launch()
             try:
-                before_shots, before_error = _capture_before(repo, worktree, frontend, browser, sandbox)
+                before_shots, before_error = _capture_before(
+                    repo, worktree, frontend, browser, sandbox, sandbox_config
+                )
                 after_shots, check_signals = _capture_after_and_run_checks(
                     worktree.path, frontend, judge, browser, video_dir, sandbox
                 )
@@ -228,13 +239,32 @@ def _load_glitch_scan(
 
 
 def _capture_before(
-    repo: Path, worktree: Worktree, frontend: FrontendConfig, browser: Browser, sandbox: Sandbox
+    repo: Path,
+    worktree: Worktree,
+    frontend: FrontendConfig,
+    browser: Browser,
+    sandbox: Sandbox,
+    sandbox_config: SandboxConfig,
 ) -> tuple[dict[int, bytes], str | None]:
     """Render `worktree.base_commit` — the repo exactly as it was before the
     agent touched anything — in a disposable scratch worktree, so the
     visual diff compares two real renders rather than a render against a
     guess. No video/glitch scanning here — that's about the agent's shipped
-    result, not the pre-agent baseline."""
+    result, not the pre-agent baseline.
+
+    Phase 10: consults the base-state cache first, keyed the same way
+    `attribution/engine.py`'s baseline check is (`base_commit` +
+    lockfile hash + sandbox image) — a `run_with_retries` loop, or a
+    suite re-grading the same repo HEAD across many tasks, shares this
+    cache entry rather than re-rendering the same pre-agent page every
+    time. A miss renders exactly as before and saves the result.
+    """
+    lockfile_hash = compute_lockfile_hash(repo, worktree.base_commit)
+    key = cache_key(worktree.base_commit, lockfile_hash, sandbox_config.image)
+    cached = load_screenshots(DEFAULT_CACHE_DIR, key)
+    if cached is not None and all(vw in cached for vw in frontend.viewports):
+        return cached, None
+
     try:
         with scratch_worktree(repo, worktree.base_commit) as base_path:
             copy_vendored_dependencies(repo, base_path)
@@ -245,6 +275,7 @@ def _capture_before(
                     vw: _screenshot(browser, frontend.url, vw, frontend.viewport_height)
                     for vw in frontend.viewports
                 }
+        save_screenshots(DEFAULT_CACHE_DIR, key, shots)
         return shots, None
     except FrontendServerError as exc:
         return {}, str(exc)
