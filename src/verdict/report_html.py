@@ -36,6 +36,7 @@ from verdict.schema import (
     Signal,
     TaskRun,
     Verdict,
+    VerdictStatus,
 )
 
 _STATUS_CLASS = {
@@ -132,7 +133,10 @@ def _render_verdict_detail(verdict: Verdict) -> str:
 
 def _render_task_run(config_label: str, task_run: TaskRun) -> str:
     verdict = task_run.final
-    status_class = "pass" if task_run.done else "fail"
+    if verdict.status is VerdictStatus.ERROR:
+        status_class = "error"
+    else:
+        status_class = "pass" if task_run.done else "fail"
     return (
         f'<details class="task {status_class}">'
         f'<summary><span class="status-dot"></span> '
@@ -182,11 +186,13 @@ details.task {
 }
 details.task.fail { border-left: 4px solid #d33; }
 details.task.pass { border-left: 4px solid #2a2; }
+details.task.error { border-left: 4px solid #a3a; }
 summary { cursor: pointer; list-style: none; }
 summary::-webkit-details-marker { display: none; }
 .status-dot { display: inline-block; width: 0.6em; height: 0.6em; border-radius: 50%; margin-right: 0.4em; }
 .task.pass .status-dot { background: #2a2; }
 .task.fail .status-dot { background: #d33; }
+.task.error .status-dot { background: #a3a; }
 .task-body { margin-top: 0.75rem; }
 .signal { margin: 0.4rem 0; padding: 0.5rem 0.75rem; border-radius: 6px; background: #f5f5f5; }
 .signal.fail { border-left: 3px solid #d33; }

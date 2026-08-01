@@ -27,10 +27,15 @@ _MARKS = {
     GateStatus.NA: "[dim]·[/dim]",
 }
 
+# ERROR (Phase 10) is styled magenta, distinct from NOT_DONE's red on
+# purpose — an ERROR verdict is infra that couldn't be evaluated, not an
+# agent defect; magenta reads as "different kind of red flag," not "the
+# agent failed harder."
 _VERDICT_STYLE = {
     VerdictStatus.DONE: ("bold green", "DONE"),
     VerdictStatus.NOT_DONE: ("bold red", "NOT DONE"),
     VerdictStatus.UNVERIFIED: ("bold yellow", "UNVERIFIED"),
+    VerdictStatus.ERROR: ("bold magenta", "ERROR"),
 }
 
 _ATTRIBUTION_MARK = {
@@ -85,7 +90,9 @@ def _render_signals(verdict: Verdict) -> None:
 def _render_verdict_line(verdict: Verdict) -> None:
     style, label = _VERDICT_STYLE[verdict.status]
     line = f"\n[{style}]VERDICT: {label}[/{style}]"
-    if verdict.status is not VerdictStatus.UNVERIFIED and verdict.confidence is Confidence.LOW:
+    if verdict.error is not None:
+        line += f" [dim]({verdict.error})[/dim]"
+    elif verdict.status is not VerdictStatus.UNVERIFIED and verdict.confidence is Confidence.LOW:
         line += " [dim](low confidence: no test gate ran)[/dim]"
     console.print(line)
 

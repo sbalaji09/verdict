@@ -51,6 +51,22 @@ class ProvisioningTimeoutError(SandboxUnavailableError):
     """
 
 
+class SetupError(SandboxUnavailableError):
+    """Phase 10's setup stage (dependency install, language-version-pin
+    resolution, service-dependency startup) failed in a way that isn't
+    the agent's fault: an unrecognized `services:` type/version in
+    `verdict.yml` (a real, satisfiable-looking request Verdict can't
+    fulfill — see `sandbox/services.py`'s allowlist), a declared service
+    that never became healthy, an unresolvable `.nvmrc`/`.python-version`
+    pin. A sibling of `ProvisioningTimeoutError` under the same
+    `SandboxUnavailableError` ancestor for the same reason that one is a
+    subclass of it: both mean "this attempt couldn't be evaluated," Phase
+    11's ERROR outcome is expected to fold the whole family together, and
+    Phase 10 already pulls forward a minimal `VerdictStatus.ERROR` for
+    exactly this family (see `schema.py`) rather than waiting.
+    """
+
+
 @dataclass(frozen=True)
 class ResourceLimits:
     """CPU/memory/pids/disk ceilings for one sandboxed process tree.

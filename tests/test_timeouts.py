@@ -110,7 +110,7 @@ def test_run_all_gates_directly_reports_a_hang_as_fail_not_a_crash(infinite_loop
 
 
 def test_provisioning_timeout_raises_and_never_produces_a_signal(tmp_path: Path, monkeypatch) -> None:
-    """`run_install_step` raising `ProvisioningTimeoutError` must propagate
+    """`run_setup_step` raising `ProvisioningTimeoutError` must propagate
     all the way out of `runner.run()` uncaught — this is deliberately NOT
     caught and turned into a gate Signal anywhere in the pipeline; the CLI
     layer (`cli.py`'s `_RUN_ERRORS`) is where it finally gets handled, the
@@ -118,10 +118,10 @@ def test_provisioning_timeout_raises_and_never_produces_a_signal(tmp_path: Path,
     """
     import verdict.runner as runner_module
 
-    def _raise_provisioning_timeout(worktree: Path, config: SandboxConfig) -> None:
+    def _raise_provisioning_timeout(worktree: Path, config: SandboxConfig) -> dict[str, str]:
         raise ProvisioningTimeoutError("dependency install (npm install) timed out after 1s")
 
-    monkeypatch.setattr(runner_module, "run_install_step", _raise_provisioning_timeout)
+    monkeypatch.setattr(runner_module, "run_setup_step", _raise_provisioning_timeout)
 
     repo = _git_repo(tmp_path, {"README.md": "hi\n"})
     adapter = MockAdapter(patches={"README.md": "bye\n"})
@@ -131,7 +131,7 @@ def test_provisioning_timeout_raises_and_never_produces_a_signal(tmp_path: Path,
 
 
 def test_install_step_timeout_raises_provisioning_timeout_error(tmp_path: Path, monkeypatch) -> None:
-    """The real (not monkeypatched) `run_install_step`, with a stand-in
+    """The real (not monkeypatched) `run_setup_step`, with a stand-in
     install command that hangs — proves the timeout->exception wiring
     itself, not just that the exception type propagates correctly.
     """
@@ -144,7 +144,7 @@ def test_install_step_timeout_raises_provisioning_timeout_error(tmp_path: Path, 
     config = SandboxConfig(backend="local", install_timeout_seconds=1)
 
     with pytest.raises(ProvisioningTimeoutError, match="timed out"):
-        install_module.run_install_step(worktree, config)
+        install_module.run_setup_step(worktree, config)
 
 
 def test_install_step_no_command_detected_is_a_silent_noop(tmp_path: Path) -> None:
@@ -154,7 +154,7 @@ def test_install_step_no_command_detected_is_a_silent_noop(tmp_path: Path) -> No
 
     worktree = tmp_path / "worktree"
     worktree.mkdir()
-    install_module.run_install_step(worktree, SandboxConfig(backend="local"))  # must not raise
+    install_module.run_setup_step(worktree, SandboxConfig(backend="local"))  # must not raise
 
 
 # --- 3. the global per-attempt budget --------------------------------------

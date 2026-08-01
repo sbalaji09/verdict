@@ -54,7 +54,7 @@ class Confidence(str, Enum):
 
 
 class VerdictStatus(str, Enum):
-    """The three-way outcome of a whole Verdict."""
+    """The outcome of a whole Verdict."""
 
     DONE = "done"
     NOT_DONE = "not_done"
@@ -62,6 +62,24 @@ class VerdictStatus(str, Enum):
     """Zero PROVEN gates actually ran (all were N/A, or no signals at all).
     Distinct from DONE: there's nothing executed to ground a claim of
     correctness in, so Verdict refuses to report success by default.
+    """
+
+    ERROR = "error"
+    """Phase 10's minimal pull-forward of Phase 11's fuller ERROR outcome:
+    the attempt couldn't be *evaluated* at all — sandbox provisioning
+    failed, a declared service never became healthy, the install step
+    hung — as distinct from NOT_DONE (the agent's code was evaluated and
+    found wanting) and UNVERIFIED (evaluated, incompletely, but nothing
+    observed was wrong). Never derived from `signals`/`_proven_applicable`
+    the way the other three statuses are — a `Verdict` is constructed
+    directly with `status_override=ERROR` (see `status` below) by whatever
+    caught the underlying `SandboxError`, since by definition nothing
+    executed to compute a signal-derived status from. Excluded from
+    `ConfigResult.pass_rate`/`pass_rate_per_dollar` (see `schema.py`
+    further down) — infra noise must never move that number in either
+    direction. Full retry policy, a dedicated provenance bucket, and
+    richer reporting remain Phase 11's job; this is deliberately just the
+    one status value plus the accounting rule.
     """
 
 
@@ -183,6 +201,16 @@ class Verdict(BaseModel):
     `status` below for how this affects DONE/NOT_DONE/UNVERIFIED, and
     DESIGN.md's Phase 9 section for the full reasoning.
     """
+    error: str | None = None
+    """Phase 10: set only when this Verdict represents a setup/
+    provisioning failure — sandbox never came up, a declared service
+    never became healthy, the install step hung. Presence of this field
+    is what makes `status` ERROR (see below), overriding the signal-
+    derived logic entirely, since by construction there's nothing to
+    derive a status *from*: `signals`/`attributions` are empty in this
+    case, not partially populated the way a `budget_exceeded` Verdict's
+    are.
+    """
 
     def _proven_applicable(self) -> list[Signal]:
         return [
@@ -210,7 +238,13 @@ class Verdict(BaseModel):
         that never ran can't vouch for the ones that would have, so
         "everything we managed to check passed" is downgraded to
         UNVERIFIED rather than reported as a clean win.
+
+        `error` set takes priority over everything else: a setup failure
+        means nothing below was actually evaluated, so there's no FAIL/
+        budget/applicable-signals logic left to run — ERROR, full stop.
         """
+        if self.error is not None:
+            return VerdictStatus.ERROR
         applicable = self._proven_applicable()
         if any(s.status is GateStatus.FAIL for s in applicable):
             return VerdictStatus.NOT_DONE
@@ -274,6 +308,17 @@ class TaskRun(BaseModel):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
+    def errored(self) -> bool:
+        """True if the attempt that decides this task's outcome couldn't
+        be evaluated at all (Phase 10's ERROR status) — infra, never the
+        agent's fault. `ConfigResult` excludes errored tasks from
+        `pass_rate`'s denominator (see below) so infra noise can't move a
+        leaderboard number in either direction.
+        """
+        return self.final.status is VerdictStatus.ERROR
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def attempt_count(self) -> int:
         return len(self.attempts)
 
@@ -330,10 +375,24 @@ class ConfigResult(BaseModel):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
+    def tasks_errored(self) -> int:
+        return sum(1 for t in self.task_runs if t.errored)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def pass_rate(self) -> float:
-        if not self.task_runs:
+        """Errored tasks are excluded from BOTH the numerator (already true
+        — `errored` implies not `done`) AND the denominator: a task whose
+        sandbox never came up was never actually graded, so it shouldn't
+        dilute the rate the way a real observed failure does. `0.0` (not
+        `None`) when every task errored — same "report an honest number,
+        never a guess" instinct as `total_cost_usd`, just with a
+        zero-tasks-graded floor instead of an unknown-cost `None`.
+        """
+        denominator = self.tasks_total - self.tasks_errored
+        if denominator <= 0:
             return 0.0
-        return self.tasks_done / self.tasks_total
+        return self.tasks_done / denominator
 
     @computed_field  # type: ignore[prop-decorator]
     @property
