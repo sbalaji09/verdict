@@ -11,6 +11,7 @@ from pathlib import Path
 from verdict.acceptance import NONE_ACCEPTANCE, AcceptanceSpec, check_acceptance
 from verdict.adapters import Adapter, AdapterError
 from verdict.attribution.engine import attribute_failures
+from verdict.backend.runner import run_backend_checks
 from verdict.config import VerdictConfig, load_config
 from verdict.frontend.runner import run_frontend_checks
 from verdict.gates.registry import run_all_gates
@@ -183,11 +184,12 @@ def run(
                     setup_env,
                 )
 
-                # Frontend and integrity checks run after gates/attribution, and
-                # their signals are appended afterward rather than folded into
-                # `signals` beforehand — attribution's bisector only knows the
-                # four gate names in gates/registry.py's GATE_RUNNERS, and would
-                # crash trying to `resolve_gate("frontend:...")`/
+                # Frontend, backend, and integrity checks run after gates/
+                # attribution, and their signals are appended afterward rather
+                # than folded into `signals` beforehand — attribution's
+                # bisector only knows the four gate names in gates/registry.py's
+                # GATE_RUNNERS, and would crash trying to
+                # `resolve_gate("frontend:...")`/`resolve_gate("backend:...")`/
                 # `resolve_gate("integrity", ...)`. A failing check here is real
                 # PROVEN evidence for Verdict.status either way; it's just not
                 # (yet) bisectable to a culprit file the way test/typecheck/build/
@@ -197,6 +199,9 @@ def run(
                 else:
                     signals = signals + run_frontend_checks(
                         repo, worktree, config, task, sandbox=sandbox, sandbox_config=sandbox_config
+                    )
+                    signals = signals + run_backend_checks(
+                        worktree.path, config, sandbox=sandbox, sandbox_config=sandbox_config
                     )
                     integrity_signal = check_test_integrity(
                         repo=repo,
@@ -340,6 +345,9 @@ def grade_existing_diff(
                 signals = signals + run_frontend_checks(
                     repo, worktree, config, task="pull request diff", sandbox=sandbox,
                     sandbox_config=sandbox_config,
+                )
+                signals = signals + run_backend_checks(
+                    repo, config, sandbox=sandbox, sandbox_config=sandbox_config
                 )
                 integrity_signal = check_test_integrity(
                     repo=repo,
