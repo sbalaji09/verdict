@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Callable
 
 import typer
+from rich.console import Console
+from rich.table import Table
 
 from verdict import economics
 from verdict.adapters import Adapter
@@ -35,14 +37,22 @@ from verdict.frontend.vision_transport import AnthropicVisionTransport
 from verdict.integrity import TestChangeAllowance
 from verdict.pr_comment import build_comment_from_file
 from verdict.report import render_task_run
-from verdict.report_html import render_html
+from verdict.report_html import HistoryKey, render_html
 from verdict.report_json import render_json
 from verdict.runner import DEFAULT_MAX_ERROR_RETRIES, grade_existing_diff, run_with_retries
 from verdict.sandbox import ResourceLimits, SandboxConfig
 from verdict.sandbox.base import SandboxUnavailableError
 from verdict.schema import ConfigResult, TaskRun, VerdictStatus
+from verdict.store import (
+    DEFAULT_BASELINE_WINDOW,
+    SQLiteStore,
+    Store,
+    TaskOutcome,
+    TaskRegression,
+    detect_regressions,
+)
 from verdict.suite import BenchConfig, LocalProcessPoolExecutor, SuiteLoadError, load_suite, run_suite
-from verdict.worktree import WorktreeError
+from verdict.worktree import WorktreeError, rev_parse
 
 app = typer.Typer(add_completion=False, help="Grade AI coding agents on executable truth.")
 
@@ -227,13 +237,23 @@ _REPORT_FORMATS = ("cli", "json", "html")
 _REPORT_HELP = f"Repeatable: which reporter(s) to produce. Choices: {' | '.join(_REPORT_FORMATS)}."
 
 
-def _write_machine_reports(formats: list[str], output_dir: Path, config_results: list[ConfigResult]) -> None:
+def _write_machine_reports(
+    formats: list[str],
+    output_dir: Path,
+    config_results: list[ConfigResult],
+    history: dict[HistoryKey, list[TaskOutcome]] | None = None,
+) -> None:
     """Writes the `json`/`html` reporters if requested — `cli` is handled
     separately by each command's own rich-based renderer, since that one
     prints to the terminal rather than a file. Shared across `run`/`bench`/
     `gate` so all three reporters (and the merge-gate/scorecard commands
     that produce them) stay in exact lockstep: one `ConfigResult` shape,
     one place that serializes it.
+
+    `history` (Phase 17) is optional and only ever threaded through to the
+    HTML reporter's trend section — `render_json`/`to_report_dict` don't
+    take it, since a machine consumer already has full query access to
+    whatever `Store` produced it and doesn't need it re-embedded here.
     """
     unknown = set(formats) - set(_REPORT_FORMATS)
     if unknown:
@@ -252,8 +272,85 @@ def _write_machine_reports(formats: list[str], output_dir: Path, config_results:
         typer.echo(f"wrote {path}")
     if "html" in formats:
         path = output_dir / "verdict-report.html"
-        path.write_text(render_html(config_results))
+        path.write_text(render_html(config_results, history=history))
         typer.echo(f"wrote {path}")
+
+
+def _build_store(store_path: Path | None) -> Store | None:
+    """`--store` is opt-in — `None` (the default) means no persistence at
+    all, the same "off unless explicitly requested" stance every other
+    side-effecting flag in this CLI takes (`--max-attempts`,
+    `--cost-ceiling-usd`, ...). `SQLiteStore` is the only backend wired to
+    the CLI; a caller embedding Verdict as a library can pass any other
+    `Store` implementation directly to `persist_run`/`detect_regressions`
+    without touching this function at all.
+    """
+    return SQLiteStore(store_path) if store_path is not None else None
+
+
+def _persist_run(
+    store: Store | None,
+    config_results: list[ConfigResult],
+    commit_sha: str | None,
+    run_label: str | None,
+    baseline_window: int,
+    regression_alpha: float,
+) -> tuple[str | None, dict[HistoryKey, list[TaskOutcome]]]:
+    """Persists `config_results` (if `--store` was given) and prints any
+    regressions found against recent history. Returns the new `run_id`
+    (`None` if no store) and a `history` dict ready for
+    `render_html`/`_write_machine_reports`'s trend section.
+
+    Regression detection here is informational only — it never changes a
+    command's exit code. This mirrors Phase 7's own explicit stance on
+    calibration/flakiness ("no automatic CI gate on a statistical
+    signal" — see DESIGN.md): `verdict gate`'s exit code is governed
+    purely by PROVEN checks against the diff actually under review: a
+    historical trend is real signal worth a human's attention, but
+    blocking a merge on it would be a different, weaker kind of promise
+    than blocking on an executed check that failed on THIS change.
+    """
+    if store is None:
+        return None, {}
+
+    run_id = store.record_run(config_results, commit_sha=commit_sha, label=run_label)
+
+    regressions = detect_regressions(
+        store,
+        config_results,
+        baseline_window=baseline_window,
+        alpha=regression_alpha,
+        exclude_run_id=run_id,
+    )
+    _render_regressions(regressions)
+
+    history: dict[HistoryKey, list[TaskOutcome]] = {}
+    for config_result in config_results:
+        for task_run in config_result.task_runs:
+            key = (config_result.label, task_run.task, task_run.agent, task_run.repo)
+            history[key] = list(
+                store.history(task_run.task, task_run.agent, task_run.repo, config_label=config_result.label)
+            )
+    return run_id, history
+
+
+def _render_regressions(regressions: list[TaskRegression]) -> None:
+    if not regressions:
+        return
+    typer.secho(
+        f"\n{len(regressions)} regression(s) flagged against recorded history:",
+        fg=typer.colors.RED,
+        bold=True,
+    )
+    for r in regressions:
+        c = r.comparison
+        p = f"{c.p_value:.4f}" if c.p_value is not None else "n/a"
+        typer.secho(
+            f"  [REGRESSION] {r.config_label} / {r.task!r}: "
+            f"{c.baseline_label} {c.baseline.pass_rate:.0%} -> "
+            f"{c.candidate_label} {c.candidate.pass_rate:.0%} (p={p}, alpha={c.alpha})",
+            fg=typer.colors.RED,
+        )
 
 
 @app.command(name="run")
@@ -430,6 +527,28 @@ def bench_cmd(
             "Cooperative, not preemptive — see DESIGN.md's Phase 15 section."
         ),
     ),
+    store: Path | None = typer.Option(
+        None,
+        "--store",
+        help=(
+            "Path to a SQLite history db — if given, this run's results are persisted and checked "
+            "for regressions against recorded history (see `verdict history`). Off by default."
+        ),
+    ),
+    commit_sha: str | None = typer.Option(
+        None, "--commit-sha", help="Commit this run graded, recorded alongside it. Free-form, optional."
+    ),
+    run_label: str | None = typer.Option(
+        None, "--run-label", help="Free-form label for this run in --store history (e.g. a CI job name)."
+    ),
+    baseline_window: int = typer.Option(
+        DEFAULT_BASELINE_WINDOW,
+        "--baseline-window",
+        help="How many of the most recent prior recorded runs form the regression baseline.",
+    ),
+    regression_alpha: float = typer.Option(
+        0.05, "--regression-alpha", help="Significance threshold for the historical regression z-test."
+    ),
 ) -> None:
     """Run every --agent against every task in --suite, then print a
     pass-rate-per-dollar leaderboard and a failure-mode breakdown.
@@ -466,10 +585,14 @@ def bench_cmd(
         cost_ceiling_usd=cost_ceiling_usd if cost_ceiling_usd > 0 else None,
     )
 
+    _run_id, history = _persist_run(
+        _build_store(store), results, commit_sha, run_label, baseline_window, regression_alpha
+    )
+
     if "cli" in report:
         economics.render(results)
         render_failure_modes(results)
-    _write_machine_reports(report, output_dir, results)
+    _write_machine_reports(report, output_dir, results, history=history)
 
 
 @app.command(name="gate")
@@ -520,6 +643,32 @@ def gate_cmd(
             "gate). Off by default."
         ),
     ),
+    store: Path | None = typer.Option(
+        None,
+        "--store",
+        help=(
+            "Path to a SQLite history db — if given, this run's results are persisted and checked "
+            "for regressions against recorded history (see `verdict history`). Off by default. "
+            "A flagged regression is printed but never changes this command's exit code — see "
+            "DESIGN.md's Phase 17 section for why only a PROVEN failure on THIS diff does that."
+        ),
+    ),
+    commit_sha: str | None = typer.Option(
+        None,
+        "--commit-sha",
+        help="Commit this run graded, recorded alongside it. Defaults to `git rev-parse HEAD` in --repo.",
+    ),
+    run_label: str | None = typer.Option(
+        None, "--run-label", help="Free-form label for this run in --store history (e.g. a CI job name)."
+    ),
+    baseline_window: int = typer.Option(
+        DEFAULT_BASELINE_WINDOW,
+        "--baseline-window",
+        help="How many of the most recent prior recorded runs form the regression baseline.",
+    ),
+    regression_alpha: float = typer.Option(
+        0.05, "--regression-alpha", help="Significance threshold for the historical regression z-test."
+    ),
 ) -> None:
     """Grade `--repo` exactly as it's already checked out against `--base`
     — no adapter, no isolation. This is the merge-gate command: a pull
@@ -546,10 +695,21 @@ def gate_cmd(
         raise typer.Exit(code=2) from exc
 
     task_run = TaskRun(task=verdict.task, agent=label, repo=verdict.repo, attempts=[verdict])
+    config_results = [ConfigResult(label=label, task_runs=[task_run])]
+
+    if commit_sha is None and store is not None:
+        try:
+            commit_sha = rev_parse(repo, "HEAD")
+        except WorktreeError:
+            commit_sha = None  # not a git repo, or HEAD unresolvable — persist without one
+
+    _run_id, history = _persist_run(
+        _build_store(store), config_results, commit_sha, run_label, baseline_window, regression_alpha
+    )
 
     if "cli" in report:
         render_task_run(task_run)
-    _write_machine_reports(report, output_dir, [ConfigResult(label=label, task_runs=[task_run])])
+    _write_machine_reports(report, output_dir, config_results, history=history)
 
     if not verdict.done:
         sys.exit(1)
@@ -712,6 +872,108 @@ def pr_comment_cmd(
         typer.secho(f"no report found at {report_path}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2)
     typer.echo(build_comment_from_file(report_path))
+
+
+# Phase 17: querying and comparing against persisted history. A separate
+# `typer.Typer` sub-app (this codebase's first) rather than two more flat
+# top-level commands — "history list"/"history compare" reads as one
+# family of operations on a `--store`, the same way a real CLI groups
+# subcommands under a noun rather than flattening everything.
+history_app = typer.Typer(add_completion=False, help="Query and compare against persisted run history.")
+app.add_typer(history_app, name="history")
+
+
+@history_app.command(name="list")
+def history_list_cmd(
+    store: Path = typer.Option(..., "--store", help="Path to a SQLite history db."),
+    task: str | None = typer.Option(None, "--task", help="Narrow to one task's outcome history over time."),
+    agent: str | None = typer.Option(None, "--agent", help="Narrow to one agent — requires --task/--repo."),
+    repo: str | None = typer.Option(None, "--repo", help="Narrow to one repo — requires --task/--agent."),
+    config_label: str | None = typer.Option(None, "--config-label", help="Narrow to one config label."),
+    limit: int = typer.Option(20, "--limit", help="Most-recent N entries to show."),
+) -> None:
+    """With no --task/--agent/--repo: lists recorded RUNS, most recent
+    first. With all three of --task/--agent/--repo given: lists that exact
+    task's OUTCOME history over time instead — the same query
+    `regression.py` runs internally, exposed directly so a team can see
+    the trend a regression flag (or the HTML report's sparkline) is based
+    on.
+    """
+    db = SQLiteStore(store)
+
+    if task is not None or agent is not None or repo is not None:
+        if task is None or agent is None or repo is None:
+            raise typer.BadParameter("--task, --agent, and --repo must all be given together")
+        outcomes = db.history(task, agent, repo, config_label=config_label, limit=limit)
+        if not outcomes:
+            typer.echo("no recorded history for this (task, agent, repo)")
+            return
+        table = Table(title=f"History — {agent} × {task[:60]!r}")
+        table.add_column("recorded_at")
+        table.add_column("config")
+        table.add_column("commit")
+        table.add_column("status")
+        for o in outcomes:
+            table.add_row(
+                o.recorded_at.isoformat(),
+                o.config_label,
+                (o.commit_sha or "—")[:12],
+                f"[green]{o.status}[/green]" if o.done else f"[red]{o.status}[/red]",
+            )
+        Console().print(table)
+        return
+
+    runs = db.runs(limit=limit)
+    if not runs:
+        typer.echo("no recorded runs")
+        return
+    table = Table(title="Recorded runs")
+    table.add_column("run_id")
+    table.add_column("recorded_at")
+    table.add_column("commit")
+    table.add_column("label")
+    table.add_column("configs")
+    for r in runs:
+        table.add_row(
+            r.run_id, r.recorded_at.isoformat(), (r.commit_sha or "—")[:12], r.label or "—",
+            ", ".join(r.config_labels),
+        )
+    Console().print(table)
+
+
+@history_app.command(name="compare")
+def history_compare_cmd(
+    store: Path = typer.Option(..., "--store", help="Path to a SQLite history db."),
+    run_id: str = typer.Option(..., "--run-id", help="A previously recorded run to check for regressions."),
+    baseline_window: int = typer.Option(
+        DEFAULT_BASELINE_WINDOW,
+        "--baseline-window",
+        help="How many of the most recent prior recorded runs form the regression baseline.",
+    ),
+    alpha: float = typer.Option(
+        0.05, "--regression-alpha", help="Significance threshold for the historical regression z-test."
+    ),
+) -> None:
+    """Re-run regression detection for an already-recorded `--run-id`
+    against its own historical baseline — useful for retroactively
+    checking any past run without re-grading anything. Reuses exactly the
+    same `detect_regressions` this codebase's `bench`/`gate` commands
+    already call inline (`_persist_run` in this module) — never a
+    separate implementation of the comparison itself.
+    """
+    db = SQLiteStore(store)
+    config_results = db.get_config_results(run_id)
+    if not config_results:
+        typer.secho(f"no recorded run found for run_id={run_id!r}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    regressions = detect_regressions(
+        db, config_results, baseline_window=baseline_window, alpha=alpha, exclude_run_id=run_id
+    )
+    if not regressions:
+        typer.secho("no regressions found against recorded history", fg=typer.colors.GREEN)
+        return
+    _render_regressions(regressions)
 
 
 if __name__ == "__main__":
