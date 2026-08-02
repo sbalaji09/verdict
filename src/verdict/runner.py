@@ -8,6 +8,7 @@ import dataclasses
 import time
 from pathlib import Path
 
+from verdict.acceptance import NONE_ACCEPTANCE, AcceptanceSpec, check_acceptance
 from verdict.adapters import Adapter, AdapterError
 from verdict.attribution.engine import attribute_failures
 from verdict.config import VerdictConfig, load_config
@@ -94,6 +95,7 @@ def run(
     adapter: Adapter,
     sandbox_config: SandboxConfig | None = None,
     allow_test_changes: TestChangeAllowance | None = None,
+    acceptance: AcceptanceSpec | None = None,
 ) -> Verdict:
     """Run `adapter` on `task` inside a throwaway worktree of `repo`, grade
     the result against every applicable gate (test/typecheck/build/lint),
@@ -122,9 +124,19 @@ def run(
     whatever it's given without knowing (or needing to know) which of
     those trusted sources it came from — that policy decision belongs to
     the caller, not here.
+
+    `acceptance` (Phase 13) defaults to `None`, resolved to
+    `acceptance.NONE_ACCEPTANCE` below — a task with no held-out
+    FAIL_TO_PASS/PASS_TO_PASS tests declared gets exactly the pre-Phase-13
+    behavior, no `acceptance` signal at all. See `acceptance.py`'s module
+    docstring for the on-disk format and grading semantics; only
+    `suite/runner.py` constructs a non-empty one today (from a
+    `SuiteTask`'s own `task.yml`/`tests.patch`), since a bare `verdict run`
+    has no task directory to source a patch from.
     """
     sandbox_config = sandbox_config or SandboxConfig()
     allowance = allow_test_changes or DENY_ALL
+    acceptance = acceptance or NONE_ACCEPTANCE
     deadline = _budget_deadline(sandbox_config)
 
     with isolated_worktree(repo) as worktree:
@@ -198,6 +210,16 @@ def run(
                         env=setup_env,
                     )
                     signals = signals + [integrity_signal]
+
+                    # Phase 13: runs in its OWN scratch worktree/sandbox
+                    # (check_acceptance's job, not this call site's) since
+                    # applying `tests.patch` mutates a working tree, and
+                    # every check above this line already ran against
+                    # `worktree.path` unpatched — reusing it here would
+                    # contaminate what they saw.
+                    acceptance_signal = check_acceptance(repo, attempt_commit, acceptance, sandbox_config)
+                    if acceptance_signal is not None:
+                        signals = signals + [acceptance_signal]
         finally:
             teardown_services(service_session)
 
@@ -379,6 +401,7 @@ def _run_attempt(
     sandbox_config: SandboxConfig | None,
     max_error_retries: int,
     allow_test_changes: TestChangeAllowance | None,
+    acceptance: AcceptanceSpec | None,
 ) -> list[Verdict]:
     """One logical attempt at `task`, with bounded automatic retry ONLY
     for `_EVALUATION_ERRORS` — infra that raised instead of returning a
@@ -403,6 +426,7 @@ def _run_attempt(
                     adapter=adapter,
                     sandbox_config=sandbox_config,
                     allow_test_changes=allow_test_changes,
+                    acceptance=acceptance,
                 )
             )
             return verdicts
@@ -419,6 +443,7 @@ def run_with_retries(
     sandbox_config: SandboxConfig | None = None,
     max_error_retries: int = DEFAULT_MAX_ERROR_RETRIES,
     allow_test_changes: TestChangeAllowance | None = None,
+    acceptance: AcceptanceSpec | None = None,
 ) -> TaskRun:
     """Attempt `task` up to `max_attempts` times, stopping early on the
     first DONE. Every attempt is kept — including failed, abandoned ones —
@@ -442,7 +467,9 @@ def run_with_retries(
     attempts: list[Verdict] = []
     for _ in range(max(max_attempts, 1)):
         attempts.extend(
-            _run_attempt(task, repo, adapter, sandbox_config, max_error_retries, allow_test_changes)
+            _run_attempt(
+                task, repo, adapter, sandbox_config, max_error_retries, allow_test_changes, acceptance
+            )
         )
         latest = attempts[-1]
         if latest.done or latest.status is VerdictStatus.ERROR:
