@@ -128,15 +128,35 @@ class CalibrationResult(BaseModel):
     judge_name: str
     total: int
     agreements: int
+    unavailable: int = 0
+    """How many examples `judge.judge(...)` had no opinion on at all
+    (`VisionJudgment.passed is None` — Phase 16's real judge reports this
+    on a transport failure, `MockVisionJudge` never does). Excluded from
+    BOTH `concordance`'s numerator and denominator, same reasoning
+    `ConfigResult.pass_rate` already uses for excluding ERROR-status
+    tasks: a call that never produced a real opinion wasn't actually
+    graded, so it shouldn't dilute a measure of how good the judge's real
+    opinions are, in either direction. Not silently dropped, though —
+    `unavailable_examples` names exactly which ones, the same "no silent
+    caps" instinct the rest of this codebase's reporting follows.
+    """
+    unavailable_examples: list[str] = Field(default_factory=list)
     threshold: float = DEFAULT_CONCORDANCE_THRESHOLD
     disagreements: list[Disagreement] = Field(default_factory=list)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
+    def graded(self) -> int:
+        """Examples the judge actually formed a real opinion on —
+        `concordance`'s true denominator."""
+        return self.total - self.unavailable
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def concordance(self) -> float | None:
-        if self.total == 0:
+        if self.graded == 0:
             return None
-        return self.agreements / self.total
+        return self.agreements / self.graded
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -155,13 +175,24 @@ def run_calibration(
     judging it (not preloaded in `LabeledExample`) so a large dataset
     doesn't hold every image in memory at once — the judge only ever needs
     one at a time.
+
+    An example the judge had NO opinion on (`VisionJudgment.passed is
+    None` — Phase 16's real judge on a transport failure) is neither an
+    agreement nor a disagreement; it's tallied separately as
+    `unavailable` and named in `unavailable_examples`, never silently
+    counted as a disagreement (which would understate concordance for a
+    reason that has nothing to do with judgment quality) or as an
+    agreement (which would overstate it the same way).
     """
     agreements = 0
+    unavailable_examples: list[str] = []
     disagreements: list[Disagreement] = []
     for example in examples:
         screenshot_bytes = example.screenshot_path.read_bytes()
         judgment = judge.judge(screenshot_bytes, example.intent)
-        if judgment.passed == example.human_label:
+        if judgment.passed is None:
+            unavailable_examples.append(example.name)
+        elif judgment.passed == example.human_label:
             agreements += 1
         else:
             disagreements.append(
@@ -178,6 +209,8 @@ def run_calibration(
         judge_name=judge.name,
         total=len(examples),
         agreements=agreements,
+        unavailable=len(unavailable_examples),
+        unavailable_examples=unavailable_examples,
         threshold=threshold,
         disagreements=disagreements,
     )
@@ -187,21 +220,31 @@ def render_calibration(result: CalibrationResult, console: Console | None = None
     console = console or Console()
 
     concordance = result.concordance
-    concordance_str = f"{concordance:.1%}" if concordance is not None else "unknown (0 examples)"
+    concordance_str = f"{concordance:.1%}" if concordance is not None else "unknown (0 graded examples)"
     color = "green" if result.meets_threshold else "red"
 
     table = Table(title=f"Judge calibration — {result.judge_name}")
     table.add_column("examples", justify="right")
+    table.add_column("graded", justify="right")
     table.add_column("agreements", justify="right")
+    table.add_column("unavailable", justify="right")
     table.add_column("concordance", justify="right")
     table.add_column("threshold", justify="right")
     table.add_row(
         str(result.total),
+        str(result.graded),
         str(result.agreements),
+        str(result.unavailable),
         f"[{color}]{concordance_str}[/{color}]",
         f"{result.threshold:.0%}",
     )
     console.print(table)
+
+    if result.unavailable_examples:
+        console.print(
+            f"[yellow]{result.unavailable} example(s) unavailable[/yellow] (judge call failed or "
+            f"returned no opinion, excluded from concordance): {', '.join(result.unavailable_examples)}"
+        )
 
     if not result.meets_threshold:
         console.print(

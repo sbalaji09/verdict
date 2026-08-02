@@ -1,8 +1,12 @@
 """Phase 7: judge calibration. Concordance is plain arithmetic over a
 labeled dataset, tested against fake judges with known, deliberately
-imperfect behavior — no real vision-model integration exists to test
-against (see DESIGN.md's Phase 4 section), so a fake judge that we know the
-right answer for is what proves the accounting.
+imperfect behavior. Phase 16 adds a real `VisionJudge` (`RealVisionJudge`,
+provider-agnostic, backed by a `VisionModelTransport`) — calibrated the
+same way, against a scripted FAKE transport (never real network; see
+`test_run_calibration_end_to_end_against_the_real_judge_with_a_fake_
+transport` below), so this module's own accounting is now provably
+exercised through the real judge implementation, not just hand-rolled
+fakes of `VisionJudge` itself.
 """
 
 from __future__ import annotations
@@ -17,7 +21,12 @@ from verdict.calibration import (
     load_labeled_dataset,
     run_calibration,
 )
-from verdict.frontend.vision_judge import VisionJudgment
+from verdict.frontend.vision_judge import (
+    RealVisionJudge,
+    TransportResult,
+    VisionJudgment,
+    VisionTransportError,
+)
 
 
 def _write_dataset(tmp_path: Path, entries: list[dict], screenshot_name: str = "shot.png") -> Path:
@@ -166,3 +175,76 @@ def test_calibration_result_concordance_is_none_for_zero_examples() -> None:
     result = CalibrationResult(judge_name="x", total=0, agreements=0)
     assert result.concordance is None
     assert result.meets_threshold is False
+
+
+# --- Phase 16: end-to-end against RealVisionJudge, transport faked -------
+
+
+class _ScriptedTransport:
+    """A `VisionModelTransport` double scripted by intent text — the
+    "mocked provider transport" the real judge is calibrated against here.
+    Never touches the network; `RealVisionJudge` (the real, shipped
+    integration) is otherwise exercised completely unmodified, so this
+    proves calibration's accounting against the actual judge code path,
+    not a hand-rolled `VisionJudge` fake.
+    """
+
+    name = "scripted"
+
+    def __init__(self, scripted: dict[str, TransportResult | Exception]) -> None:
+        self._scripted = scripted
+
+    def complete(self, screenshot_png: bytes, system_prompt: str, user_text: str) -> TransportResult:
+        for intent, outcome in self._scripted.items():
+            if intent in user_text:
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+        raise AssertionError(f"no scripted outcome for user_text={user_text!r}")
+
+
+def test_run_calibration_end_to_end_against_the_real_judge_with_a_fake_transport(tmp_path: Path) -> None:
+    """The full stack this phase adds: `load_labeled_dataset` ->
+    `RealVisionJudge.judge` (real prompt-building, real injection-hardened
+    system prompt, real degrade-on-failure contract) -> a scripted fake
+    `VisionModelTransport` -> `run_calibration`'s concordance/unavailable
+    accounting. Two agreements, one disagreement, one transport failure —
+    proving all three buckets flow through correctly from a labeled subset.
+    """
+    manifest = _write_dataset(
+        tmp_path,
+        [
+            {"name": "agree-pass", "screenshot": "shot.png", "intent": "cta visible", "human_label": True},
+            {"name": "agree-fail", "screenshot": "shot.png", "intent": "modal closed", "human_label": False},
+            {"name": "disagree", "screenshot": "shot.png", "intent": "footer link", "human_label": True},
+            {"name": "flaky-call", "screenshot": "shot.png", "intent": "nav logo", "human_label": True},
+        ],
+    )
+    examples = load_labeled_dataset(manifest)
+
+    transport = _ScriptedTransport(
+        {
+            "cta visible": TransportResult(
+                passed=True, rationale="cta is visible", tokens_input=10, tokens_output=5
+            ),
+            "modal closed": TransportResult(
+                passed=False, rationale="modal is closed", tokens_input=10, tokens_output=5
+            ),
+            "footer link": TransportResult(
+                passed=False, rationale="no footer link seen", tokens_input=10, tokens_output=5
+            ),
+            "nav logo": VisionTransportError("simulated API timeout"),
+        }
+    )
+    judge = RealVisionJudge(transport)
+
+    result = run_calibration(judge, examples, threshold=0.9)
+
+    assert result.total == 4
+    assert result.unavailable == 1
+    assert result.unavailable_examples == ["flaky-call"]
+    assert result.graded == 3
+    assert result.agreements == 2
+    assert result.concordance == pytest.approx(2 / 3)
+    assert {d.name for d in result.disagreements} == {"disagree"}
+    assert judge.name == "vision-judge:scripted"
