@@ -3301,3 +3301,222 @@ optional fields and its "missing a required field parses to None" contract.
   the AGENT's own final code; there is no "base commit" render for it to
   reuse the way frontend's before-screenshot or integrity's collected-
   count check do.
+
+## Phase 15 — Scaling the Suite Runner
+
+## The problem, restated
+
+`run_suite` (`suite/runner.py`) has, since Phase 5, been one Python `for`
+loop over configs with a list comprehension of `(config, task)` pairs
+inside it — every pair fully sequential, however many CPU cores or
+however idle the sandbox's dependencies actually are. That was the right
+starting shape (Phase 5's own DESIGN.md scoped "how a suite actually
+executes many runs efficiently" out explicitly, as a later concern) but
+it doesn't scale: a suite of `T` tasks × `C` configs takes `T * C` times
+one attempt's wall-clock, with every pair's own sandbox sitting otherwise
+idle while every other pair waits its turn. Phase 15 is that later
+concern, arriving now that there's a real multi-phase pipeline (setup,
+gates, attribution, frontend, backend) worth not serializing dozens of
+times over.
+
+## Why this was safe to parallelize at all
+
+Every `(config, task)` pair was already independent by construction —
+`run_suite`'s own docstring has said so since Phase 5 ("one config's cost
+or failure has no bearing on another's, and one task's result doesn't
+gate whether the next task runs"), and `runner.py::run` gives each
+*attempt* its own worktree and its own `Sandbox` (`create_sandbox`,
+entered and torn down inside one `with` block) regardless of how many
+other attempts exist. Nothing about grading pair A reads or writes state
+that grading pair B could observe. That's the entire reason Phase 15
+could be "run the same independent units through a bounded pool" rather
+than "redesign the pipeline to be parallel-safe" — the safety property
+already existed, this phase just stopped throwing it away by running
+everything through one loop.
+
+## The `Executor` abstraction
+
+`suite/executor.py` is the one new seam: a `Protocol` —
+`Executor.run(fn, items) -> results`, order-preserving regardless of
+completion order — with two implementations:
+
+- **`SerialExecutor`** — the exact old behavior, one item at a time in
+  this process. Still `run_suite`'s default (`executor: Executor | None
+  = None` resolves to this), so nothing that doesn't explicitly ask for
+  parallelism sees any change in behavior, timing, or cost profile — the
+  same "safer default, opt-in speedup" pattern `SandboxConfig.backend`
+  and `max_attempts` already use elsewhere in this codebase.
+- **`LocalProcessPoolExecutor`** — a bounded `concurrent.futures.
+  ProcessPoolExecutor(max_workers=N)`. Each `(config, task)` pair still
+  gets its own worktree and `Sandbox`, unchanged; the process pool is a
+  second, coarser layer on top, bounding how many of those sandboxes are
+  ever live at once and giving each pair's work an OS-process boundary
+  from every other pair's (the same "a hang or crash can't corrupt this
+  process" reasoning Phase 0's DESIGN.md already gave for shelling out to
+  agent CLIs, now applied one level up).
+
+**Why a `Protocol`, not a hardcoded `ProcessPoolExecutor` call inside
+`run_suite`.** The brief asks for "local process pool now, keep the
+backend pluggable for a future distributed executor." A distributed
+backend (work items dispatched to a queue other machines consume) is a
+different transport for the exact same contract — `fn(*item)` in, an
+order-preserving `list[result]` out — not a different shape of problem.
+Keeping that contract as a `Protocol` means a future `RayExecutor` or
+`CeleryExecutor` is a new class implementing `.run()`, not a change to
+`run_suite`'s aggregation logic at all.
+
+**Why `fn` and `items` have to be plain, module-level, and picklable.**
+`ProcessPoolExecutor` ships work to a subprocess by pickling it — a
+closure over local state, or a bound method on an object holding a lock
+or an open handle, can't cross that boundary. `_run_task_within_ceiling`
+(`suite/runner.py`) is the one function `run_suite` ever hands an
+`Executor`, built at module scope for exactly this reason; every argument
+it closes over (`SuiteTask`, `BenchConfig`, `SandboxConfig`, the
+`_CostCeiling` described below) is already a plain dataclass or a
+`multiprocessing.Manager` proxy — nothing in this codebase's adapters
+holds unpicklable state either (checked directly: `ClaudeCodeAdapter`/
+`MockAdapter`/etc. are all plain attribute-only classes, no locks, no
+live subprocess handles kept as instance state).
+
+## Aggregation: order-independent execution, order-preserving output
+
+The brief's hard requirement — parallel and serial runs produce
+byte-identical leaderboards — is met by never trusting completion order
+for anything. `run_suite` builds its work items in the exact same nested
+order the original serial loop iterated (`for config in configs: for
+task in tasks`), hands that flat list to `Executor.run`, and slices the
+returned flat list back into per-config chunks by *position*
+(`flat_task_runs[config_index * len(tasks) : ...]`), never by whichever
+item happened to finish first. `Executor.run`'s own contract (see its
+docstring) guarantees the returned list matches input order regardless
+of backend — `LocalProcessPoolExecutor` submits every item up front and
+reads results back in *submission* order, blocking on an earlier future
+if it happens to finish later, rather than reassembling by whichever
+`Future` completes first. Combined with every pair being independent
+(previous section), this means the parallel and serial paths compute the
+literal same set of `TaskRun`s from the literal same inputs — the only
+thing that can differ between the two runs is wall-clock time and each
+`Verdict.created_at` timestamp, never anything the leaderboard reports on
+(`tests/test_bench.py::test_run_suite_parallel_produces_the_same_
+leaderboard_as_serial` asserts this directly, by comparing every
+leaderboard-relevant field while deliberately excluding `created_at`).
+
+## The global cost ceiling: exact when serial, cooperative when parallel
+
+`run_suite(..., cost_ceiling_usd=...)` caps total spend across every pair
+in the call. The tracker (`suite/runner.py::_CostCeiling`) is backed by
+`multiprocessing.Manager` proxies (`Value`/`Lock`), not a plain float or
+`threading.Lock` — a plain float only ever sees updates from its own
+process, which defeats a *global* ceiling the moment more than one
+worker process exists; `Manager` proxies are the one primitive here
+that's actually safe to share with (and pickle to) arbitrary worker
+processes, so the same `_CostCeiling` instance works unmodified whether
+`run_suite` ends up using `SerialExecutor` or `LocalProcessPoolExecutor`.
+
+Enforcement is checked once per work item, right before that item would
+otherwise start: if the running total already meets the ceiling, the
+pair is never run at all — it's recorded as a real `TaskRun` with a
+single `Verdict(status=ERROR, error="skipped: suite cost ceiling...")`,
+reusing Phase 10/11's existing ERROR machinery (`ConfigResult.pass_rate`
+already excludes ERROR from both numerator and denominator — a skipped
+pair was never graded, so it shouldn't dilute the rate in either
+direction, the identical reasoning Phase 10 gave for infra-caused ERROR).
+
+This is **exact under `SerialExecutor`** — one item finishes, updates the
+shared total, and *only then* does the next item's check run, so the
+ceiling is never overshot by more than the last item that was already
+in flight when it was checked (impossible under serial: nothing is ever
+in flight but the one item being checked). It is **best-effort under a
+parallel pool** — several items can already be running concurrently, each
+having passed its own check before any of them updated the shared total,
+so the true final spend can overshoot the ceiling by up to
+`max_workers - 1` in-flight items' worth of cost. Deliberately not
+patched over with something that looks more exact: making it precise
+would mean killing already-running sandboxes from outside their own
+`with` block the moment the ceiling crosses — a real, disruptive
+capability (an agent mid-attempt loses its work, a sandbox teardown from
+a second thread/process has to be gotten right) that the brief didn't ask
+for and this phase didn't need to build. This is the same "report the
+true, sometimes coarser, thing rather than a precise-looking guess that
+happens to be wrong" instinct `SandboxConfig.attempt_budget_seconds`
+already uses for its own per-attempt ceiling — just applied one level up,
+across the whole suite instead of one attempt.
+
+## Resource caps across workers
+
+Phase 15 doesn't add a new aggregate resource accountant on top of
+`ResourceLimits` (`sandbox/config.py`, unchanged) — it relies on a
+structural invariant instead: at most `max_workers` sandboxes are ever
+live at once (that's what "bounded pool" means), and each individual
+sandbox is already capped by its own `SandboxConfig.limits`
+(`--sandbox-cpus`/`--sandbox-memory-mb`, Phase 8). So the aggregate
+ceiling across the whole pool is `max_workers * limits` by construction,
+with no separate bookkeeping needed — choosing `--max-workers` *is* the
+resource-cap knob, the same way it's already the concurrency-bound knob.
+An operator sizing a suite run for a host with a known CPU/memory budget
+divides that budget by one sandbox's `limits` to pick `--max-workers`,
+rather than Verdict trying to guess a safe number itself.
+
+## CLI
+
+`verdict bench` gains `--max-workers` (default `1` — serial, unchanged
+from before this phase) and `--cost-ceiling-usd` (default `0`, meaning
+disabled — the same `0`-spells-`None` convention
+`--attempt-budget-seconds` already established, since a Typer option
+can't carry a bare `None` from the command line).
+
+## Tests
+
+- `tests/test_executor.py` — the `Executor` abstraction in isolation, no
+  suite/adapter machinery involved: `SerialExecutor` preserves order,
+  `LocalProcessPoolExecutor` preserves order even when earlier items
+  finish *later* than later ones (proving output order tracks input
+  order, not completion order), the concurrency bound is actually
+  honored (`max_workers=2` against 8 concurrent-capable items never
+  shows more than 2 overlapping at once, measured from real start/end
+  timestamps recorded across process boundaries via a `Manager.list()`),
+  and the pool is genuinely concurrent, not accidentally serialized
+  (`max_workers=4` against 8 quarter-second items finishes well under
+  the fully-serial 2.4s).
+- `tests/test_bench.py::test_run_suite_parallel_produces_the_same_
+  leaderboard_as_serial` — the byte-identical claim, checked end to end
+  against the same real-git-repo suite fixture every other `test_bench.py`
+  test uses: same suite, same configs, once through `SerialExecutor`
+  (the default) and once through `LocalProcessPoolExecutor(max_workers=
+  3)`, asserting equal leaderboard-relevant snapshots (label order,
+  tasks_total/done/errored, pass_rate, pass_rate_per_dollar,
+  total_cost_usd, and per-task done/attempt_count/cost — every field
+  `created_at` doesn't touch).
+- `tests/test_bench.py::test_run_suite_cost_ceiling_skips_work_once_
+  reached` — exact enforcement under the default `SerialExecutor`: two
+  configs of two $0.01 tasks each against a $0.015 ceiling, asserting the
+  first config runs to completion (spending $0.02, crossing the ceiling
+  mid-way) and the second config is skipped in full, each skipped
+  `TaskRun` carrying an ERROR `Verdict` with a ceiling-referencing
+  `error` message.
+
+## What's explicitly out of scope for Phase 15
+
+- **A real distributed executor.** `Executor` is built to make one
+  addable without touching `run_suite`, but Phase 15 ships exactly two
+  implementations (`SerialExecutor`, `LocalProcessPoolExecutor`) — no
+  queue, no remote worker protocol, no partial-failure/retry-on-a-
+  different-machine handling a distributed backend would eventually need.
+- **Preemptive cost-ceiling enforcement** — see above; a pair already
+  running when the ceiling crosses always finishes, it's never killed
+  mid-attempt.
+- **Aggregate resource accounting beyond `max_workers * limits`** — no
+  live host CPU/memory sampling, no dynamic worker-count throttling if
+  the host is actually under more pressure than `--max-workers` assumed;
+  the cap is structural (pool size × per-sandbox limits), not measured.
+- **Threading as a third backend.** Only a process pool — Verdict's own
+  work per pair is I/O/subprocess-bound (shelling out to `docker`,
+  `claude`, gate tools) rather than CPU-bound in this process, so threads
+  would technically work too, but a process pool was chosen instead for
+  the same reason Phase 0 chose a subprocess boundary for agent CLIs: a
+  hang or crash in one pair's work can't corrupt another pair's, or this
+  process's own state, the way a shared-memory thread crash risks.
+- **Streaming/incremental leaderboard output** — `run_suite` still
+  returns only after every pair (or every skip) is accounted for; there's
+  no partial-results reporting while a large parallel suite is still
+  running.
