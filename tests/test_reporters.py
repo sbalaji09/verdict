@@ -7,6 +7,7 @@ serialization/rendering, not grading.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 
 from verdict.report_html import render_html
@@ -22,6 +23,7 @@ from verdict.schema import (
     TaskRun,
     Verdict,
 )
+from verdict.store.base import TaskOutcome
 
 
 def _verdict(*, status: GateStatus, judged_status: GateStatus | None = None) -> Verdict:
@@ -138,3 +140,67 @@ def test_html_report_never_lets_a_judged_pass_look_like_the_verdict_passed() -> 
     # marked failing.
     html = render_html([_config_result("bad", done=False)])
     assert 'class="task fail"' in html
+
+
+def test_html_report_links_an_artifact_path_instead_of_printing_it_as_text() -> None:
+    verdict = Verdict(
+        task="frontend glitch",
+        agent="mock",
+        repo="/tmp/x",
+        attempt=AttemptResult(diff=""),
+        signals=[
+            Signal(
+                name="frontend:glitch_scan:load",
+                provenance=Provenance.PROVEN,
+                status=GateStatus.FAIL,
+                detail="flicker detected",
+                artifact_path="/tmp/verdict-capture/run1/load.webm",
+            )
+        ],
+    )
+    task_run = TaskRun(task=verdict.task, agent="mock", repo="/tmp/x", attempts=[verdict])
+    html = render_html([ConfigResult(label="cfg", task_runs=[task_run])])
+
+    assert '<a class="artifact" href="/tmp/verdict-capture/run1/load.webm">' in html
+
+
+# --- Phase 17: History / trend section -------------------------------
+
+
+def test_html_report_omits_the_history_section_by_default() -> None:
+    html = render_html([_config_result("good", done=True)])
+    assert "<h2>History</h2>" not in html
+
+
+def test_html_report_renders_a_history_section_when_history_is_supplied() -> None:
+    outcomes = [
+        TaskOutcome(
+            run_id=f"run-{i}",
+            recorded_at=datetime(2026, 1, i + 1, tzinfo=UTC),
+            commit_sha=f"sha{i}",
+            config_label="good",
+            task="fix add()",
+            agent="mock",
+            repo="/tmp/x",
+            done=(i != 2),  # one failure in the middle of an otherwise-clean run
+            status="done" if i != 2 else "not_done",
+        )
+        for i in range(5)
+    ]
+    html = render_html(
+        [_config_result("good", done=True)],
+        history={("good", "fix add()", "mock", "/tmp/x"): outcomes},
+    )
+
+    assert "<h2>History</h2>" in html
+    assert "<svg" in html
+    assert "4/5" in html  # 4 of the 5 recorded outcomes passed
+    HTMLParser().feed(html)  # still well-formed with the section present
+
+
+def test_html_report_history_section_handles_a_task_with_no_recorded_history() -> None:
+    html = render_html(
+        [_config_result("good", done=True)],
+        history={("good", "fix add()", "mock", "/tmp/x"): []},
+    )
+    assert "no history" in html
