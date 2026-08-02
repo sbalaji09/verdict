@@ -3153,3 +3153,151 @@ both.
   similar helper for producing `tests.patch` from a scratch checkout; a
   benchmark author runs `git diff` themselves, per this phase's own
   format docstring.
+
+## Phase 14 — Backend Runtime Truth
+
+## The problem, restated
+
+`test`/`typecheck`/`build`/`lint` all grade the CODE — they run it in
+some form (unit tests execute functions, typecheck/build parse and
+compile) but none of them ever run the SERVICE, the long-lived process a
+backend actually is once deployed. A change can compile cleanly, pass
+every unit test, and still crash on startup, fail its own schema
+migration, or serve a 500 for the one endpoint the task was actually
+about — none of it visible to any of the four existing gates, for the
+structural reason that none of them boot anything. Phase 4 already solved
+the identical problem for the frontend (a page can render broken HTML
+that no unit test would catch) by actually starting the dev server and
+looking at the real rendered result. Phase 14 is that same move, mirrored
+onto the backend: boot the service for real, inside the sandbox, and
+check it the way a human would — does it come up, does its migration
+apply, does a real request against it come back right.
+
+## Config shape: `backend:`, mirroring `frontend:`'s own contract
+
+`config.py` gains `BackendConfig`/`SmokeRequestSpec`, parsed by
+`_parse_backend_config` in exactly the same style `_parse_frontend_config`
+already established — a top-level `backend:` section, required `start`
+(the boot command) and `health_url` (what readiness polls), everything
+else defaulted, and the section parses to `None` (checks entirely skipped)
+if either required field is missing. Optional `migrate` (a one-shot
+command run before `start`) and `smoke` (a list of literal HTTP requests
+— `path` joined onto `health_url`'s own host via `urllib.parse.urljoin`,
+so a task only writes the host once, plus `method`/`body`/`headers`/
+`expect_status`/`expect_body_contains`/`name`). Entirely opt-in, the
+identical "no section, no checks" contract `frontend:` already set: most
+repos don't declare one, `run_backend_checks` returns `[]` immediately.
+
+## Three PROVEN signals, run in dependency order
+
+`backend/runner.py::run_backend_checks` — `backend:migrate` (skipped
+entirely if not configured), then `backend:boot`, then one `backend:
+smoke:<name>` per configured request — each stage only runs if the one
+before it didn't already fail:
+
+- A failing migration means there's no point booting against an
+  unmigrated schema, so `backend:migrate` FAIL short-circuits the whole
+  check — `backend:boot`/`backend:smoke:*` never even appear, rather than
+  running against a database in an unknown state and reporting a
+  confusing secondary failure.
+- A failing boot means there's nothing to send a smoke request to, so
+  `backend:boot` FAIL likewise skips every `backend:smoke:*` entry.
+- `backend:boot` itself: `backend/server.py::boot_service` — a
+  background process (`Sandbox.exec_background`, the exact primitive
+  `frontend/server.py::dev_server` already uses) polled against
+  `health_url` until it answers (any status < 500 counts — a genuinely
+  wrong response is a `smoke` check's job, not the readiness probe's) or
+  the process exits early or `ready_timeout_seconds` elapses. `network=
+  True` on the background exec is the identical, intentional exception
+  to gates' network-off default `dev_server` already makes, for the
+  identical reason (see DESIGN.md's Phase 8 section) — a service that
+  can't reach its own health endpoint can't be reasonably graded as
+  "broken" by the sandbox's own network policy.
+- `backend:smoke:<name>` — one real `urllib.request` call per configured
+  entry, checked against `expect_status` and, if given,
+  `expect_body_contains`; both must hold for a PASS.
+
+**Deliberately NOT built as one shared module with `frontend/server.py`**,
+even though the boot-and-poll logic is structurally identical: the two
+call sites' failure semantics (`BackendServiceError` vs.
+`FrontendServerError`, "service" vs. "dev server" in every message a
+human eventually reads) read differently enough that ~40 lines of
+duplication was judged the smaller cost than a cross-domain shared
+abstraction neither side individually needs more of — matching this
+codebase's own stated preference (see CLAUDE.md-equivalent guidance) for
+duplication over a premature abstraction at this size.
+
+## Where it slots into the pipeline, and why there
+
+Same slot, same reasoning, as `run_frontend_checks` and Phase 12/13's
+checks: appended to `signals` in `runner.py`'s `run()`/
+`grade_existing_diff()`, right alongside `run_frontend_checks`, after
+gates/attribution — `attribute_failures` only resolves the four
+`GATE_RUNNERS` names via `gates/registry.py::resolve_gate` and would
+`KeyError` on `"backend:boot"` the same way it would on `"frontend:..."`
+or `"integrity"`. Runs against the SAME already-open `sandbox` gates/
+frontend checks used (no fresh scratch worktree needed, unlike Phase
+12/13's integrity/acceptance checks — there's no "before" state to render
+for a boot check, only the agent's actual final code).
+
+## Distinguishing agent-caused boot failure from infra inability to provision
+
+This is enforced by CONSTRUCTION, not by new code in this module: by the
+time `run_backend_checks` executes, `runner.py` has already gotten the
+sandbox itself created (`create_sandbox`, any failure there is a
+`SandboxUnavailableError` that never reaches this module at all) and any
+declared `services:` health-checked (Phase 10's `setup_services`, whose
+`SetupError` — also a `SandboxError` — is raised and propagates straight
+past this module too). Both are already `_EVALUATION_ERRORS` Phase 11
+catches to build an `ERROR` `Verdict`, with bounded auto-retry, entirely
+upstream of where this phase's code ever runs. So everything `backend/
+runner.py` can actually observe — a process that exits non-zero, a
+migration that fails, a health endpoint that never answers, a smoke
+request that comes back wrong — is by construction something the AGENT's
+own code did, never infrastructure Verdict itself couldn't provide. The
+one place this module could still leak an infra failure through as a
+false NOT_DONE — a `docker exec` itself failing mid-check (not the
+command it ran, the exec mechanism) — is deliberately left uncaught
+(`boot_service`/`_run_migrate`/`_run_smoke_request` only catch their OWN
+raised `BackendServiceError`/HTTP errors, never `SandboxUnavailableError`),
+so it propagates the same way it already does for every existing gate in
+`gates/`, all the way to the same ERROR-routing/retry machinery — no
+special-casing needed, the existing exception-propagation contract
+(confirmed in Phase 11's own DESIGN.md section) already does the right
+thing here for free.
+
+## Tests
+
+`tests/test_backend.py` — a real, dependency-free `http.server`-based
+service (matching `test_frontend.py`'s own "real service, not mocked"
+standard), covering: the exact requested scenario (a change that compiles
+and passes its unrelated unit tests but crashes on startup is NOT_DONE,
+with the `test` signal itself confirmed still PASS so the point isn't
+lost in a coincidental failure elsewhere), a real fix that boots and
+passes its smoke check reaching DONE, a service that boots fine but
+answers a smoke request wrong still being NOT_DONE, no `backend:*`
+signals at all without a `backend:` section, a failing migration skipping
+boot/smoke entirely, and a passing migration running before boot.
+`tests/test_config.py` gained parsing coverage for `backend:`'s required/
+optional fields and its "missing a required field parses to None" contract.
+
+## What's explicitly out of scope for Phase 14
+
+- **A shared boot-and-poll module with `frontend/server.py`** — see above;
+  duplicated on purpose at this size.
+- **Migration rollback / down-migration checking** — `migrate` runs
+  exactly once, forward; there's no notion of verifying a migration is
+  reversible.
+- **Smoke requests running INSIDE Playwright/a browser** — these are
+  plain `urllib.request` calls, not driven through the sandboxed-browser
+  machinery Phase 4/8 built for the frontend; a backend has no rendering
+  surface to protect the way a frontend's arbitrary agent-authored JS
+  does, so the extra machinery isn't needed here.
+- **Concurrent/load smoke testing** — one request per configured `smoke:`
+  entry, sequentially; nothing about throughput, concurrency, or
+  sustained load is checked.
+- **Caching a boot check across attempts** — unlike Phase 10's base-state
+  cache (keyed on a shared `base_commit`), a boot check's whole point is
+  the AGENT's own final code; there is no "base commit" render for it to
+  reuse the way frontend's before-screenshot or integrity's collected-
+  count check do.
