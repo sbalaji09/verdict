@@ -6,7 +6,17 @@ format and the suite runner's design.
 
 from __future__ import annotations
 
+from verdict.suite.executor import Executor, LocalProcessPoolExecutor, SerialExecutor
 from verdict.suite.loader import SuiteLoadError, SuiteTask, load_suite
 from verdict.suite.runner import BenchConfig, run_suite
 
-__all__ = ["SuiteLoadError", "SuiteTask", "load_suite", "BenchConfig", "run_suite"]
+__all__ = [
+    "SuiteLoadError",
+    "SuiteTask",
+    "load_suite",
+    "BenchConfig",
+    "run_suite",
+    "Executor",
+    "SerialExecutor",
+    "LocalProcessPoolExecutor",
+]
