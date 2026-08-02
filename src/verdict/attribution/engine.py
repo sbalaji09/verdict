@@ -87,31 +87,35 @@ def attribute_failures(
     return attributions
 
 
-def _reproduces_at(
-    repo: Path, ref: str, gate: str, identity: str | None, sandbox_config: SandboxConfig
-) -> Reproduction:
-    """Phase 10: consults the base-state cache before rendering anything.
-    `ref` is always `worktree.base_commit` in practice — the one thing
-    that never changes across however many times this gets called in a
-    single `attribute_failures` run (once per failing signal being
-    attributed) — so a cache hit here is the common case after the first
-    call, not a rare one.
+def base_gate_signals(repo: Path, ref: str, sandbox_config: SandboxConfig) -> dict[str, Signal] | None:
+    """Every gate's PROVEN signal at `ref`, consulting the base-state
+    cache before rendering anything — the reusable half of what used to
+    be `_reproduces_at`'s own inline logic, pulled out in Phase 12 so
+    `integrity.py`'s "did the collected test count drop since the base
+    commit" check can reuse the exact same cached render attribution's
+    baseline check already produces, rather than re-deriving it.
 
-    On a MISS, renders every gate at once (not just `gate`) and caches
-    the full set — the next failing signal's baseline check, whatever
-    gate it's against, then hits the cache too. Any failure along the way
-    (a `SandboxError`, or anything else genuinely unanticipated) degrades
-    to SKIP/untestable rather than raising — this baseline check has
-    always been resilient by design (a failed baseline check just means
-    "fall through to bisection," not "abort the attempt"), and Phase 10
-    doesn't change that.
+    `ref` is always `worktree.base_commit` in practice — the one thing
+    that never changes across however many times this gets called for a
+    single attempt (once per failing signal being attributed, plus once
+    for the integrity check) — so a cache hit here is the common case
+    after the first call, not a rare one.
+
+    On a MISS, renders every gate at once and caches the full set — the
+    next caller, whatever it's actually looking for, then hits the cache
+    too. Returns `None` on any failure along the way (a `SandboxError`,
+    or anything else genuinely unanticipated) rather than raising — a
+    failed baseline render has always been something callers degrade
+    gracefully from (attribution falls through to bisection; integrity
+    simply skips the count-drop sub-check), never something that aborts
+    the attempt.
     """
     lockfile_hash = compute_lockfile_hash(repo, ref)
     key = cache_key(ref, lockfile_hash, sandbox_config.image)
 
     cached = load_gate_signals(DEFAULT_CACHE_DIR, key)
-    if cached is not None and gate in cached:
-        return reproduction_from_signal(cached[gate], identity)
+    if cached is not None:
+        return cached
 
     try:
         with scratch_worktree(repo, ref) as wt:
@@ -127,13 +131,21 @@ def _reproduces_at(
                     env=setup_env,
                 )
     except SandboxError:
-        return Reproduction.SKIP
+        return None
     except Exception:
-        return Reproduction.SKIP
+        return None
 
     gate_signals = {signal.name: signal for signal in signals}
     save_gate_signals(DEFAULT_CACHE_DIR, key, gate_signals)
+    return gate_signals
 
+
+def _reproduces_at(
+    repo: Path, ref: str, gate: str, identity: str | None, sandbox_config: SandboxConfig
+) -> Reproduction:
+    gate_signals = base_gate_signals(repo, ref, sandbox_config)
+    if gate_signals is None:
+        return Reproduction.SKIP
     target_signal = gate_signals.get(gate)
     if target_signal is None:
         return Reproduction.SKIP
