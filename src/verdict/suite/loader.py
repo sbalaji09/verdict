@@ -30,6 +30,13 @@ guarded). This is read HERE, from `task.yml`, before any agent worktree
 exists — the trust boundary `integrity.TestChangeAllowance` documents:
 this file is the benchmark author's, never the graded repo's own
 `verdict.yml`, which an agent could edit itself.
+
+Two more optional keys, `fail_to_pass`/`pass_to_pass` (Phase 13), declare
+held-out SWE-bench-style acceptance tests — see `acceptance.py`'s module
+docstring for the full on-disk format (`tests.patch`, a sibling of
+`task.yml`, never copied into `repo/`) and grading semantics. Read HERE
+for the same reason `allow_test_changes` is: before any agent worktree
+exists, so the agent never gets a chance to see, and answer, its own exam.
 """
 
 from __future__ import annotations
@@ -39,6 +46,7 @@ from pathlib import Path
 
 import yaml
 
+from verdict.acceptance import NONE_ACCEPTANCE, AcceptanceSpec
 from verdict.integrity import DENY_ALL, TestChangeAllowance
 
 
@@ -61,6 +69,11 @@ class SuiteTask:
     docstring and `TestChangeAllowance`'s own for the trust boundary this
     represents. Defaults to `DENY_ALL`, not something lenient, for every
     task that doesn't declare it explicitly."""
+    acceptance: AcceptanceSpec = NONE_ACCEPTANCE
+    """From `task.yml`'s `fail_to_pass`/`pass_to_pass` keys plus the
+    sibling `tests.patch` file — see `acceptance.py`'s module docstring.
+    Defaults to `NONE_ACCEPTANCE` (no held-out tests) for every task that
+    doesn't declare either list."""
 
 
 def _parse_allow_test_changes(data: dict[str, object], task_yml: Path) -> TestChangeAllowance:
@@ -74,6 +87,32 @@ def _parse_allow_test_changes(data: dict[str, object], task_yml: Path) -> TestCh
     raise SuiteLoadError(
         f"{task_yml}: allow_test_changes must be true/false or a list of path globs, got {raw!r}"
     )
+
+
+def _string_list(raw: object, key: str, task_yml: Path) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list) and all(isinstance(x, str) for x in raw):
+        return raw
+    raise SuiteLoadError(f"{task_yml}: {key} must be a list of strings, got {raw!r}")
+
+
+def _parse_acceptance(data: dict[str, object], task_dir: Path, task_yml: Path) -> AcceptanceSpec:
+    fail_to_pass = _string_list(data.get("fail_to_pass"), "fail_to_pass", task_yml)
+    pass_to_pass = _string_list(data.get("pass_to_pass"), "pass_to_pass", task_yml)
+    if not fail_to_pass and not pass_to_pass:
+        return NONE_ACCEPTANCE
+
+    patch_path = task_dir / "tests.patch"
+    if not patch_path.is_file():
+        raise SuiteLoadError(
+            f"{task_yml}: fail_to_pass/pass_to_pass declared but {patch_path} does not exist"
+        )
+    patch = patch_path.read_text()
+    if not patch.strip():
+        raise SuiteLoadError(f"{patch_path}: empty — fail_to_pass/pass_to_pass need a real patch")
+
+    return AcceptanceSpec(fail_to_pass=tuple(fail_to_pass), pass_to_pass=tuple(pass_to_pass), patch=patch)
 
 
 def _load_one_task(task_dir: Path) -> SuiteTask:
@@ -93,12 +132,14 @@ def _load_one_task(task_dir: Path) -> SuiteTask:
 
     category = str(data["category"]) if data.get("category") else None
     allow_test_changes = _parse_allow_test_changes(data, task_yml)
+    acceptance = _parse_acceptance(data, task_dir, task_yml)
     return SuiteTask(
         name=task_dir.name,
         task=str(data["task"]),
         repo=repo,
         category=category,
         allow_test_changes=allow_test_changes,
+        acceptance=acceptance,
     )
 
 

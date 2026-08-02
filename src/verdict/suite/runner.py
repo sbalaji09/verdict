@@ -62,6 +62,9 @@ def _run_task(
         # suite-wide override here; each task's own declaration is what
         # governs it.
         allow_test_changes=task.allow_test_changes,
+        # Phase 13: the task's own held-out FAIL_TO_PASS/PASS_TO_PASS
+        # tests, if it declared any — see `acceptance.py`.
+        acceptance=task.acceptance,
     )
 
 
