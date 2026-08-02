@@ -30,6 +30,7 @@ from verdict.flakiness import (
     run_flakiness,
 )
 from verdict.frontend.vision_judge import MockVisionJudge, VisionJudge
+from verdict.integrity import TestChangeAllowance
 from verdict.pr_comment import build_comment_from_file
 from verdict.report import render_task_run
 from verdict.report_html import render_html
@@ -278,6 +279,16 @@ def run_cmd(
             "being reported as ERROR. Never spent on a legitimate agent NOT_DONE."
         ),
     ),
+    allow_test_changes: bool = typer.Option(
+        False,
+        "--allow-test-changes",
+        help=(
+            "This --task legitimately requires editing tests (e.g. \"add tests for X\") — skip the "
+            "Phase 12 integrity gate's test-tampering checks. You're invoking this flag yourself, "
+            "outside the repo being graded, which is exactly the trust boundary that makes it safe "
+            "here (never settable from the repo's own verdict.yml). Off by default."
+        ),
+    ),
     report: list[str] = typer.Option(["cli"], "--report", help=_REPORT_HELP),
     output_dir: Path = typer.Option(
         Path("verdict-report"), "--output-dir", help="Where json/html reports are written."
@@ -328,6 +339,7 @@ def run_cmd(
         max_attempts=max_attempts,
         sandbox_config=sandbox_config,
         max_error_retries=max_error_retries,
+        allow_test_changes=TestChangeAllowance(allowed=allow_test_changes),
     )
 
     if "cli" in report:
@@ -472,6 +484,16 @@ def gate_cmd(
     health_timeout_seconds: int = typer.Option(
         30, "--health-timeout-seconds", help="How long a declared service gets to pass its health check."
     ),
+    allow_test_changes: bool = typer.Option(
+        False,
+        "--allow-test-changes",
+        help=(
+            "This PR/diff legitimately edits tests — skip the Phase 12 integrity gate's "
+            "test-tampering checks. An operator/CI-supplied flag, deliberately never something a "
+            "PR's own verdict.yml can set (that would let a PR author disable its own integrity "
+            "gate). Off by default."
+        ),
+    ),
 ) -> None:
     """Grade `--repo` exactly as it's already checked out against `--base`
     — no adapter, no isolation. This is the merge-gate command: a pull
@@ -487,7 +509,12 @@ def gate_cmd(
         health_timeout_seconds,
     )
     try:
-        verdict = grade_existing_diff(repo=repo, base_ref=base, sandbox_config=sandbox_config)
+        verdict = grade_existing_diff(
+            repo=repo,
+            base_ref=base,
+            sandbox_config=sandbox_config,
+            allow_test_changes=TestChangeAllowance(allowed=allow_test_changes),
+        )
     except WorktreeError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
