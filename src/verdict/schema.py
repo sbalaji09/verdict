@@ -38,6 +38,17 @@ class GateStatus(str, Enum):
     """The gate's stack wasn't detected in this repo (e.g. no tsconfig.json
     for typecheck). Not a failure — a repo property, not an agent defect —
     but also not a pass: it contributes nothing to done/not-done either way.
+
+    Phase 16 reuses this same meaning for a JUDGED signal whose model call
+    itself failed or came back malformed (network error, bad auth, a
+    response that didn't match the judgment schema) — a `RealVisionJudge`
+    that couldn't reach a model has exactly as much to say about the
+    screenshot as a repo with no `tsconfig.json` has about its types:
+    nothing, honestly reported as nothing, never guessed at as a PASS or a
+    FAIL. Since `Verdict.status` only ever consults PROVEN signals, this
+    was already scoring-inert for JUDGED signals before Phase 16 — the
+    change is only that a missing opinion now renders distinctly from a
+    real FAIL opinion instead of looking like one (see `report.py`).
     """
 
 
@@ -129,6 +140,19 @@ class Signal(BaseModel):
     this exists as a structured field rather than staying buried in
     `detail`'s free text: it needs to compare this commit's count against
     the base commit's without re-parsing a human-readable string."""
+    cost_usd: float | None = None
+    """Real $ spent producing THIS signal — `None` for every PROVEN gate
+    (running `pytest`/`tsc`/etc. has no per-signal API cost) and populated
+    only by a real `VisionJudge` (Phase 16), whose JUDGED opinion comes
+    from a priced model API call. Deliberately separate from
+    `AttemptResult.cost_usd`/`TaskRun.total_cost_usd`, which price what it
+    cost the AGENT to attempt the task — a vision judge is Verdict's OWN
+    evaluation cost, spent regardless of which agent or config is being
+    graded, so folding it into the same total would conflate "cost to
+    attempt" with "cost to grade" and quietly change what
+    `pass_rate_per_dollar` measures. `None` here reads as "free or
+    unknown," the same convention `AttemptResult.cost_usd` already uses.
+    """
 
 
 class AttemptResult(BaseModel):

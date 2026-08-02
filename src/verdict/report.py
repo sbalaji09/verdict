@@ -75,7 +75,15 @@ def _render_signals(verdict: Verdict) -> None:
     if judged:
         console.print("[bold]JUDGED[/bold] [dim](model opinion)[/dim]")
         for s in judged:
-            mark = "[green]~[/green]" if s.status is GateStatus.PASS else "[yellow]~[/yellow]"
+            if s.status is GateStatus.PASS:
+                mark = "[green]~[/green]"
+            elif s.status is GateStatus.NA:
+                # Phase 16: the judge had no opinion at all (transport
+                # failure) — distinct from a real FAIL opinion, so it
+                # can't read as "the model looked and said no."
+                mark = "[dim]~[/dim]"
+            else:
+                mark = "[yellow]~[/yellow]"
             console.print(f"  {mark} {s.name:<12}  {s.detail}")
         console.print()
 
