@@ -120,6 +120,15 @@ class Signal(BaseModel):
     Phase 4's glitch-scan video recording. Only ever supporting evidence for
     a PROVEN/JUDGED result already decided from other data; nothing reads
     the artifact itself to decide status."""
+    tests_collected: int | None = None
+    """How many individual tests the tool reported (pytest's junit
+    `tests` count, Jest's `numTotalTests`) — `None` for gates where a
+    discrete "how many tests" number doesn't apply (typecheck, build,
+    lint) or isn't reported the same way (`go test`'s event stream has no
+    single "collected" figure). Phase 12's integrity check is the reason
+    this exists as a structured field rather than staying buried in
+    `detail`'s free text: it needs to compare this commit's count against
+    the base commit's without re-parsing a human-readable string."""
 
 
 class AttemptResult(BaseModel):

@@ -42,28 +42,32 @@ def _write(tmp_path: Path, name: str, content: str) -> str:
 
 def test_parse_junit_all_passing(tmp_path: Path) -> None:
     path = _write(tmp_path, "r.xml", _JUNIT_ALL_PASS)
-    detail, status, failures = _parse_junit(path, fallback="")
+    detail, status, failures, collected = _parse_junit(path, fallback="")
     assert status is GateStatus.PASS
     assert "2 passed, 0 failed" in detail
     assert failures == []
+    assert collected == 2
 
 
 def test_parse_junit_with_failure(tmp_path: Path) -> None:
     path = _write(tmp_path, "r.xml", _JUNIT_ONE_FAIL)
-    detail, status, failures = _parse_junit(path, fallback="")
+    detail, status, failures, collected = _parse_junit(path, fallback="")
     assert status is GateStatus.FAIL
     assert "1 passed, 1 failed" in detail
     assert "test_b" in detail
     assert len(failures) == 1
     assert failures[0].identity == "tests/test_x.py::test_b"
     assert failures[0].message == "boom"
+    assert collected == 2
 
 
 def test_parse_junit_missing_file_falls_back(tmp_path: Path) -> None:
-    detail, status, failures = _parse_junit(str(tmp_path / "missing.xml"), fallback="raw output here")
+    missing = str(tmp_path / "missing.xml")
+    detail, status, failures, collected = _parse_junit(missing, fallback="raw output here")
     assert status is None
     assert "raw output here" in detail
     assert failures == []
+    assert collected is None
 
 
 # --- jest ----------------------------------------------------------------
@@ -73,10 +77,11 @@ def test_parse_jest_success(tmp_path: Path) -> None:
         tmp_path, "r.json",
         json.dumps({"success": True, "numPassedTests": 3, "numFailedTests": 0, "numTotalTests": 3}),
     )
-    detail, status, failures = _parse_jest(path, fallback="")
+    detail, status, failures, collected = _parse_jest(path, fallback="")
     assert status is GateStatus.PASS
     assert "3/3 passed" in detail
     assert failures == []
+    assert collected == 3
 
 
 def test_parse_jest_failure(tmp_path: Path) -> None:
@@ -93,11 +98,12 @@ def test_parse_jest_failure(tmp_path: Path) -> None:
             }],
         }),
     )
-    detail, status, failures = _parse_jest(path, fallback="")
+    detail, status, failures, collected = _parse_jest(path, fallback="")
     assert status is GateStatus.FAIL
     assert "1 failed" in detail
     assert len(failures) == 1
     assert failures[0].identity == "calculator.test.js::add works"
+    assert collected == 2
 
 
 # --- go test ---------------------------------------------------------------

@@ -49,7 +49,9 @@ class PytestRunner:
             result = exec_command(
                 command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds, env=env
             )
-            detail, status, failures = _parse_junit(report_path, fallback=result.stdout + result.stderr)
+            detail, status, failures, collected = _parse_junit(
+                report_path, fallback=result.stdout + result.stderr
+            )
         finally:
             Path(report_path).unlink(missing_ok=True)
 
@@ -63,6 +65,7 @@ class PytestRunner:
             command=" ".join(command),
             exit_code=result.returncode,
             failures=failures,
+            tests_collected=collected,
         )
 
 
@@ -87,15 +90,15 @@ def _node_id(classname: str, name: str) -> str:
 
 def _parse_junit(
     report_path: str, fallback: str
-) -> tuple[str, GateStatus | None, list[FailureLocation]]:
+) -> tuple[str, GateStatus | None, list[FailureLocation], int | None]:
     try:
         root = ET.parse(report_path).getroot()
     except (ET.ParseError, FileNotFoundError):
-        return tail(fallback), None, []
+        return tail(fallback), None, [], None
 
     suite = root if root.tag == "testsuite" else root.find("testsuite")
     if suite is None:
-        return tail(fallback), None, []
+        return tail(fallback), None, [], None
 
     total = int(suite.get("tests", 0))
     failures_count = int(suite.get("failures", 0))
@@ -119,7 +122,7 @@ def _parse_junit(
         detail += "\nfailed: " + ", ".join(f.identity for f in failures[:10])
 
     status = GateStatus.FAIL if (failures_count or errors) else GateStatus.PASS
-    return detail, status, failures
+    return detail, status, failures, total
 
 
 class JestRunner:
@@ -153,7 +156,9 @@ class JestRunner:
             result = exec_command(
                 command, cwd=worktree, sandbox=sandbox, timeout_seconds=timeout_seconds, env=env
             )
-            detail, status, failures = _parse_jest(report_path, fallback=result.stdout + result.stderr)
+            detail, status, failures, collected = _parse_jest(
+                report_path, fallback=result.stdout + result.stderr
+            )
         finally:
             Path(report_path).unlink(missing_ok=True)
 
@@ -167,16 +172,17 @@ class JestRunner:
             command=" ".join(command),
             exit_code=result.returncode,
             failures=failures,
+            tests_collected=collected,
         )
 
 
 def _parse_jest(
     report_path: str, fallback: str
-) -> tuple[str, GateStatus | None, list[FailureLocation]]:
+) -> tuple[str, GateStatus | None, list[FailureLocation], int | None]:
     try:
         data = json.loads(Path(report_path).read_text())
     except (json.JSONDecodeError, FileNotFoundError):
-        return tail(fallback), None, []
+        return tail(fallback), None, [], None
 
     passed = data.get("numPassedTests", 0)
     failed = data.get("numFailedTests", 0)
@@ -198,7 +204,7 @@ def _parse_jest(
             )
 
     status = GateStatus.PASS if data.get("success") else GateStatus.FAIL
-    return detail, status, failures
+    return detail, status, failures, total
 
 
 class GoTestRunner:
