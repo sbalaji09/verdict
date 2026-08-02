@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Callable
 
 import typer
 
@@ -29,7 +30,8 @@ from verdict.flakiness import (
     render_flakiness,
     run_flakiness,
 )
-from verdict.frontend.vision_judge import MockVisionJudge, VisionJudge
+from verdict.frontend.vision_judge import MockVisionJudge, RealVisionJudge, VisionJudge
+from verdict.frontend.vision_transport import AnthropicVisionTransport
 from verdict.integrity import TestChangeAllowance
 from verdict.pr_comment import build_comment_from_file
 from verdict.report import render_task_run
@@ -553,12 +555,14 @@ def gate_cmd(
         sys.exit(1)
 
 
-# Only a mock ships today — same honest scope line Phase 4 drew for
-# VisionJudge itself: a real vision-model integration is its own project
-# (pick a vendor, handle auth, validate against real screenshots), not
-# something to fake here.
-_JUDGES: dict[str, type[VisionJudge]] = {
+# Phase 16: "anthropic" is the real integration — provider-agnostic at
+# the VisionJudge/VisionModelTransport layer (see vision_judge.py), one
+# concrete transport shipped so far. A second provider is a new transport
+# class and one new entry here, never a change to how calibration or this
+# dict works.
+_JUDGES: dict[str, Callable[[], VisionJudge]] = {
     "mock": MockVisionJudge,
+    "anthropic": lambda: RealVisionJudge(AnthropicVisionTransport()),
 }
 
 
@@ -576,7 +580,15 @@ def calibrate_cmd(
         "--dataset",
         help="Path to a calibration manifest.json (see examples/calibration_dataset).",
     ),
-    judge: str = typer.Option("mock", "--judge", help=f"Which VisionJudge to score: {', '.join(_JUDGES)}"),
+    judge: str = typer.Option(
+        "mock",
+        "--judge",
+        help=(
+            f"Which VisionJudge to score: {', '.join(_JUDGES)}. "
+            "\"anthropic\" reads its API key from ANTHROPIC_API_KEY — never a CLI flag or "
+            "verdict.yml — and makes real, billed API calls."
+        ),
+    ),
     threshold: float = typer.Option(
         DEFAULT_CONCORDANCE_THRESHOLD, "--threshold", help="Target concordance (fraction, e.g. 0.95)."
     ),
@@ -585,6 +597,9 @@ def calibrate_cmd(
     concordance — how often the judge's PASS/FAIL agrees with the human
     label. Never fails the process: this is a diagnostic, not a merge gate,
     so a below-threshold result prints a warning rather than a nonzero exit.
+    Examples the judge had no opinion on (a failed/malformed API call) are
+    reported separately and excluded from concordance — see
+    `CalibrationResult.unavailable`.
     """
     try:
         examples = load_labeled_dataset(dataset)
