@@ -2758,3 +2758,235 @@ correctly did, at the time) that both behave identically.
   "this repo's sandbox has failed N times across the last M runs, stop
   trying" circuit breaker. A human (or a wrapper script) still decides
   when a suite's infra is unfixably broken.
+
+## Phase 12 — Defend the Thesis: Test-Integrity Detection
+
+## The problem, restated
+
+Every prior phase's grading logic rests on one unexamined assumption: that
+a passing test suite at the final commit means the same thing it meant at
+the base commit. It doesn't have to. An agent graded on "did the PROVEN
+signals pass" has a strictly easier path to a green `test` signal than
+fixing the actual bug — delete the failing assertion, mark the test
+`xfail`, delete the test file outright, or just hardcode the literal the
+buggy code already returns. None of that is hypothetical or exotic; it's
+the single most obvious thing to try once "tests pass" is the metric.
+Phase 12 is Verdict checking its own homework: comparing the agent's final
+commit against the pre-agent base commit and flagging exactly that family
+of moves, as its own PROVEN signal that can force NOT_DONE the same way a
+real test failure already does.
+
+## Where this had to be asked, not decided: the allowance trust boundary
+
+Before writing any detection code, one question was raised rather than
+answered silently, per explicit instruction: some tasks legitimately edit
+tests ("add tests for the new endpoint" is a completely ordinary bug-fix-
+adjacent request), and a strict-by-default integrity gate will flag that
+task's own, intended work. The answer that came back combined two of the
+offered options and added a constraint that shapes the whole
+implementation:
+
+1. **A task-declared allowance** (`TestChangeAllowance`, `integrity.py`) —
+   implementable now, not deferred to a future phase.
+2. **Documented as interim**, not a permanent design: Phase 13's held-out/
+   hidden tests are the intended long-term answer to "how do you grade a
+   test-writing task safely" — once acceptance lives in tests the agent
+   can't see or edit, gaming the *visible* tests stops mattering for
+   scoring purposes, and the allowance becomes a convenience for a human
+   reading the report (skip an expected FAIL) rather than a security
+   control the grade depends on.
+3. **A hard trust-boundary rule, load-bearing today**: the allowance may
+   ONLY come from a source outside the graded repo's own control —
+   `task.yml` (benchmark-author-controlled, read by `suite/loader.py`
+   before any agent worktree exists) in suite/bench mode, or an
+   operator-supplied CLI flag (`--allow-test-changes`) in single-run/
+   merge-gate mode. It must NEVER be settable from `verdict.yml` inside
+   the graded repo/worktree, in any mode — an agent (run/bench) or a PR
+   author (gate) who could flip a flag in a file they themselves control
+   would simply disable their own integrity gate, the exact same failure
+   mode Phase 10 already guarded against for the service image allowlist
+   (`sandbox/services.py`'s `_SERVICE_IMAGES`, never a raw `image:` the
+   repo names). `VerdictConfig`/`config.py` has no `allow_test_changes`
+   field, on purpose, and `test_verdict_config_has_no_allow_test_changes_
+   field` (`tests/test_integrity.py`) asserts that structurally, not just
+   by convention.
+
+`TestChangeAllowance` is a small, frozen dataclass: `allowed: bool` plus
+an optional `allowed_paths: tuple[str, ...] | None` (glob patterns) for
+scoping a permission to specific files rather than blanket-excusing every
+test file in the repo. Default (`DENY_ALL`, a module-level constant) is
+strict — `run()`/`grade_existing_diff()`/`run_with_retries()` all resolve
+a `None` argument to `DENY_ALL`, never to something lenient, so a caller
+that forgets to pass one gets the safe behavior. Scoped vs. blanket
+matters for one more thing: a scoped allowance does NOT excuse a drop in
+collected test count (see below) — the drop can't be attributed to just
+the permitted files — while a blanket one does, since the whole test
+surface was explicitly authorized to change.
+
+## What gets checked, and how each reuses existing machinery
+
+`integrity.py::check_test_integrity` runs once per attempt, after gates
+and attribution (same slot `run_frontend_checks` already occupies, for
+the same reason — see below), and emits exactly one `Signal(name=
+"integrity", provenance=PROVEN, ...)`:
+
+- **Modified/deleted test files** — `worktree.changed_files(repo, base,
+  final)` (Phase 2's own diff primitive, unchanged) filtered to paths that
+  look like test files, then `worktree.file_content_at(repo, ref, path)`
+  (new — a thin `git show <ref>:<path>` wrapper) to tell "existed at base,
+  gone now" from "existed at base, edited" from "didn't exist at base at
+  all" (never flagged — adding a test is never suspicious). No AST
+  diffing was invented for this: the codebase already had none (Phase 2's
+  own `depgraph.py` is import-resolution only, not content diffing;
+  `synth.py`'s docstring explicitly avoids hunk-level diffing as fragile)
+  and this phase didn't need one either — whole-file before/after text is
+  enough for every check below.
+- **A drop in collected test count** — the only check that doesn't rely on
+  diffing test-file content at all, which is exactly its point: it also
+  catches an agent disabling test discovery *without* touching a
+  `test_*.py` file (deleting `pytest.ini`, editing `package.json`'s test
+  script) — a vector the file-content checks structurally can't see.
+  Needed a new structured field, `Signal.tests_collected: int | None`
+  (`schema.py`), because `gates/test.py`'s `PytestRunner`/`JestRunner`
+  already computed this number (junit's `tests` attribute, Jest's
+  `numTotalTests`) but only ever folded it into `detail`'s free text —
+  Phase 12 needed to compare two runs' counts programmatically, not
+  re-parse a sentence. `GoTestRunner` stays `None`: `go test`'s event
+  stream has no equivalent single "collected" figure, an honest gap, not
+  silently patched over. The base commit's count comes from
+  `attribution.engine.base_gate_signals` — Phase 10's own base-state-cache
+  render, pulled out of `_reproduces_at`'s inline logic into a reusable
+  public function specifically so this phase could ask it "what did the
+  `test` gate see at the base commit" without re-deriving Phase 10's
+  caching from scratch. `_reproduces_at` itself is now three lines calling
+  it — a straightforward extraction, not a behavior change (confirmed by
+  the full existing attribution/cache test suites still passing unchanged).
+- **Newly added skip/xfail markers** — a line-level diff (base file's
+  lines as a set, scan the final file's lines for ones NOT in that set)
+  against a pattern list covering pytest (`@pytest.mark.skip`,
+  `@pytest.mark.xfail`, `pytest.skip(`), unittest (`@unittest.skip`,
+  `self.skipTest(`), and JS test runners' `.skip(`/`x*(` conventions
+  (`it.skip`, `xit`, `xdescribe`, ...).
+- **Weakened or removed assertions** — two independent sub-checks, both
+  heuristic and both explicitly documented as such (see below): a net
+  DROP in assertion-keyword line count between the two file versions
+  (`assert`, `self.assert*`, `expect(`, `.should.`), and a separate
+  pattern match for assertions that got REPLACED by something trivially
+  true (`assert True`, `assert 1`, `.assertTrue(True)`) — a net-count
+  check alone would miss that swap, since a vacuous assertion still
+  counts as "an assertion" by keyword.
+- **Hardcoded expected outputs** — the one detector this phase couldn't
+  make anything but a heuristic, on purpose documented as one in its own
+  docstring: a line matching an equality assertion (`== <literal>`) whose
+  non-literal prefix is byte-identical between base and final but whose
+  literal changed. Catches `assert add(2, 3) == 5` → `assert add(2, 3) ==
+  -1` without trying to know whether the new literal is "correct" (that's
+  what re-running the `test` gate already checks) — it only flags that
+  the *expectation itself* moved, which a legitimate spec change can also
+  do. This is precisely why the allowance mechanism exists rather than an
+  outright block.
+- **A coverage drop** — genuinely best-effort, and the one place this
+  phase adds real new execution cost: `measure_pytest_coverage` runs
+  `pytest --cov=. --cov-report=term-missing` inside the sandbox and
+  parses the `TOTAL ... NN%` line; returns `None` (never raises) on ANY
+  failure — pytest-cov not installed, no importable package for `--cov`
+  to target, a timeout. Comparison logic (`coverage_regression_finding`,
+  a 2-point tolerance for run-to-run noise) is a pure function, decoupled
+  from the real I/O on purpose so it's unit-testable without a sandbox at
+  all. The base-commit measurement (`_measure_base_coverage`) mirrors
+  `base_gate_signals`'s scratch-worktree pattern but is deliberately NOT
+  cached — coverage isn't part of `sandbox/cache.py`'s schema, and adding
+  it there is real, valuable, out-of-scope work (see below). Skipped
+  outright (fast) for non-pytest repos via a cheap `PytestRunner().
+  applicable()` check before ever invoking a subprocess.
+
+Every finding is a `FailureLocation` (identity, file, `code` = the finding
+kind, `message` = the human explanation) appended to the `integrity`
+signal's `failures` list — reusing that existing field rather than
+inventing a parallel structure is what makes a FAIL here render correctly
+in the CLI/JSON/HTML reporters, the failure-mode breakdown, and (had it
+failed) attribution's causal-analysis section, with zero changes to any
+of them.
+
+## Why "integrity" can force NOT_DONE with no schema change
+
+`Verdict.status`'s FAIL check (`schema.py`) was already gate-name-agnostic
+before this phase — `any(s.status is GateStatus.FAIL for s in applicable)`
+never inspected `s.name`. So a `Signal(name="integrity", provenance=
+PROVEN, status=FAIL, ...)` automatically forces `NOT_DONE` through the
+exact same code path a real `test` FAIL already uses, confirmed rather
+than assumed: `test_gutting_tests_forces_not_done_even_though_the_test_
+gate_passes` (`tests/test_integrity.py`) runs a fake adapter that deletes
+the assertion (the `test` signal genuinely PASSES — nothing left to fail)
+through the real `runner.run()` pipeline and asserts `verdict.status is
+NOT_DONE`. Nothing in `schema.py` needed to change for this to work — the
+name-agnostic FAIL check was already exactly what Phase 12 needed.
+
+## Where it slots into the pipeline, and why there
+
+`check_test_integrity` runs in the same place, and for the same reason,
+`run_frontend_checks` already does: AFTER `attribute_failures`, not passed
+into it. `attribute_failures` bisects by calling `gates/registry.py`'s
+`resolve_gate(gate, ...)`, which only knows the four `GATE_RUNNERS` names
+(`test`/`typecheck`/`build`/`lint`) and would `KeyError` on `"integrity"`
+— exactly the same reason frontend checks were already appended after
+attribution rather than folded into `signals` before it (see that code's
+own existing comment, extended this phase to name the integrity check
+too). An `integrity` FAIL is real PROVEN evidence for `Verdict.status`
+either way; it's just not (yet) bisectable to a culprit file the way
+test/typecheck/build/lint failures are — a real, deferred gap (see below),
+not a design flaw baked in this phase.
+
+## Tests
+
+`tests/test_integrity.py` — one fixture per detector (deleted test file,
+weakened/removed assertion, added xfail marker, added skip marker,
+hardcoded literal change, collected-count drop via a `pytest.ini` deletion
+that never touches a `test_*.py` file, and a coverage drop both as a pure
+function and wired through `check_test_integrity` with `measure_pytest_
+coverage` stubbed), plus: the allowance letting a declared edit through
+end to end, a path-scoped allowance NOT excusing an out-of-scope file, a
+brand-new test file never being flagged, `run()`-level end-to-end proof
+that gutting tests forces NOT_DONE even though the `test` gate itself
+reports PASS, the same end-to-end proof that a *legitimate* test edit
+reaches DONE only with an allowance and is flagged for review without one,
+and `suite/loader.py` parsing `allow_test_changes` from `task.yml` in both
+its bool and path-list forms (plus rejecting a malformed value, and
+defaulting to deny-all without the key).
+
+## What's explicitly out of scope for Phase 12
+
+- **AST-aware or semantic diffing** — every content-based check here is a
+  line/regex pattern match over whole-file before/after text, not a
+  parsed, structural understanding of what an assertion actually claims.
+  A sufficiently indirect rewrite (extracting the same weakened check into
+  a helper function, restructuring control flow around a deleted
+  assertion) can evade every heuristic here. Real, harder work; Phase
+  13's held-out tests are the actual answer to "the agent can't game what
+  it can't see," not a smarter diff.
+- **Bisecting an `integrity` FAIL** — it's a real PROVEN signal that
+  forces NOT_DONE, but `attribute_failures` never runs on it (see above);
+  a report never says *which specific edit* caused the integrity flag the
+  way it would for a real test regression, only that one exists and why
+  (the finding list in `detail`/`failures`).
+- **Coverage-drop caching** — every check that wants a coverage number
+  pays the real `pytest --cov` cost fresh, at both commits; not folded
+  into `sandbox/cache.py`'s base-state cache the way gate signals are.
+- **Coverage for Jest/Go** — `measure_pytest_coverage` is pytest-only;
+  a JS/TS or Go repo's integrity check simply never gets a coverage
+  sub-finding, PASS or FAIL, rather than a wrong one.
+- **`verdict gate`'s exit-code/ERROR handling untouched** — `--allow-
+  test-changes` was added to `gate_cmd` for symmetry with `run_cmd`, but
+  the command's pre-existing gaps (documented in Phase 11's own "out of
+  scope") are unchanged: `grade_existing_diff` still doesn't get bounded
+  infra-error retry, and an `integrity` FAIL there produces exit 1 exactly
+  like any other `verdict.done is False`, no new exit code carved out for
+  it specifically.
+- **A generic "trusted config source" abstraction** — the allowance's
+  trust boundary is enforced by construction (only `suite/loader.py` and
+  `cli.py`'s CLI-flag parsing ever construct a non-`DENY_ALL`
+  `TestChangeAllowance`; nothing reads one from `VerdictConfig`), not by
+  a reusable "which config sources are trusted" framework. If a future
+  phase needs a second trusted-vs-repo-controlled setting, it'll likely
+  want to generalize this rather than copy it a third time — noted, not
+  built.
