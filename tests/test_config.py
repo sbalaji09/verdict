@@ -149,3 +149,69 @@ services:
     # rather than silently dropping — see test_services.py.
     assert len(config.services) == 1
     assert config.services[0].name == "db"
+
+
+def test_load_config_no_backend_section_is_none(tmp_path: Path) -> None:
+    (tmp_path / "verdict.yml").write_text("gates:\n  test: 'pytest -q'\n")
+    config = load_config(tmp_path)
+    assert config.backend is None
+
+
+def test_load_config_backend_missing_required_field_is_none(tmp_path: Path) -> None:
+    (tmp_path / "verdict.yml").write_text(
+        "backend:\n  start: 'python app.py'\n"  # no health_url
+    )
+    config = load_config(tmp_path)
+    assert config.backend is None
+
+
+def test_load_config_parses_backend_section(tmp_path: Path) -> None:
+    (tmp_path / "verdict.yml").write_text(
+        """
+backend:
+  start: "python app.py"
+  health_url: "http://localhost:8000/healthz"
+  ready_timeout_seconds: 45
+  migrate: "alembic upgrade head"
+  smoke:
+    - path: "/api/widgets"
+      expect_status: 200
+      expect_body_contains: "widgets"
+    - path: "/api/widgets"
+      method: post
+      body: '{"name": "x"}'
+      expect_status: 201
+      name: "create widget"
+"""
+    )
+    config = load_config(tmp_path)
+    assert config.backend is not None
+    backend = config.backend
+    assert backend.start == "python app.py"
+    assert backend.health_url == "http://localhost:8000/healthz"
+    assert backend.ready_timeout_seconds == 45
+    assert backend.migrate == "alembic upgrade head"
+    assert len(backend.smoke) == 2
+
+    get_spec = backend.smoke[0]
+    assert get_spec.method == "GET"
+    assert get_spec.expect_status == 200
+    assert get_spec.expect_body_contains == "widgets"
+    assert get_spec.name is None
+
+    post_spec = backend.smoke[1]
+    assert post_spec.method == "POST"  # uppercased
+    assert post_spec.body == '{"name": "x"}'
+    assert post_spec.expect_status == 201
+    assert post_spec.name == "create widget"
+
+
+def test_load_config_backend_defaults_when_only_required_fields_given(tmp_path: Path) -> None:
+    (tmp_path / "verdict.yml").write_text(
+        'backend:\n  start: "python app.py"\n  health_url: "http://localhost:8000/healthz"\n'
+    )
+    config = load_config(tmp_path)
+    assert config.backend is not None
+    assert config.backend.ready_timeout_seconds == 30
+    assert config.backend.migrate is None
+    assert config.backend.smoke == []

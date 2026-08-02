@@ -1,9 +1,10 @@
 """Loads `verdict.yml` overrides from the repo being graded.
 
-`gates` (Phase 1), `cost` (Phase 3), and `frontend` (Phase 4) are read. The
-`report` section from the README's example config belongs to a later phase
-and is still ignored rather than rejected, so a forward-looking config file
-doesn't break earlier phases.
+`gates` (Phase 1), `cost` (Phase 3), `frontend` (Phase 4), `services`
+(Phase 10), and `backend` (Phase 14) are read. The `report` section from
+the README's example config belongs to a later phase and is still ignored
+rather than rejected, so a forward-looking config file doesn't break
+earlier phases.
 """
 
 from __future__ import annotations
@@ -91,6 +92,53 @@ class FrontendConfig:
     glitch_diff_threshold: float = DEFAULT_GLITCH_DIFF_THRESHOLD
 
 
+DEFAULT_BACKEND_READY_TIMEOUT_SECONDS = 30
+DEFAULT_SMOKE_METHOD = "GET"
+DEFAULT_SMOKE_EXPECT_STATUS = 200
+
+
+@dataclass
+class SmokeRequestSpec:
+    """One literal HTTP request fired at the booted service — the "does
+    the API actually answer correctly" half of the backend runtime check,
+    as distinct from "is something listening" (that's `health_url`'s
+    job). `path` is joined onto `health_url`'s own scheme/host/port
+    (`urllib.parse.urljoin`), so a task only ever writes the host once.
+    """
+
+    path: str
+    method: str = DEFAULT_SMOKE_METHOD
+    body: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+    expect_status: int = DEFAULT_SMOKE_EXPECT_STATUS
+    expect_body_contains: str | None = None
+    name: str | None = None
+    """Free-form label for the resulting `backend:smoke:<name>` Signal —
+    defaults to `"{method} {path}"` when not given (see `backend/runner.py`)."""
+
+
+@dataclass
+class BackendConfig:
+    """Parsed `backend:` section — see README's Configuration example.
+    Entirely opt-in, the same "no section, no checks" contract
+    `frontend:` already established: most repos don't declare one, and
+    `run_backend_checks` returns `[]` immediately when `config.backend`
+    is `None`.
+    """
+
+    start: str
+    health_url: str
+    ready_timeout_seconds: int = DEFAULT_BACKEND_READY_TIMEOUT_SECONDS
+    migrate: str | None = None
+    """Optional one-shot command (e.g. `alembic upgrade head`) run BEFORE
+    `start` — a migration failure means the service never gets a chance
+    to boot against a correct schema, so `backend/runner.py` skips
+    boot/smoke checks entirely on a migrate FAIL rather than running them
+    against an unmigrated database and reporting a confusing secondary
+    failure."""
+    smoke: list[SmokeRequestSpec] = field(default_factory=list)
+
+
 @dataclass
 class TokenPricing:
     """$ per 1,000 tokens. Only used as a fallback — see runner.py — when
@@ -137,11 +185,13 @@ class VerdictConfig:
         token_pricing: TokenPricing | None = None,
         frontend: FrontendConfig | None = None,
         services: list[ServiceSpec] | None = None,
+        backend: BackendConfig | None = None,
     ) -> None:
         self.gate_overrides = gate_overrides
         self.token_pricing = token_pricing
         self.frontend = frontend
         self.services = services or []
+        self.backend = backend
 
     def override_for(self, gate: str) -> str | None:
         return self.gate_overrides.get(gate)
@@ -248,6 +298,45 @@ def _parse_frontend_config(data: dict[str, object]) -> FrontendConfig | None:
     )
 
 
+def _parse_smoke_spec(item: object) -> SmokeRequestSpec | None:
+    if not isinstance(item, dict) or not item.get("path"):
+        return None
+    headers_raw = item.get("headers") or {}
+    headers = {str(k): str(v) for k, v in headers_raw.items()} if isinstance(headers_raw, dict) else {}
+    return SmokeRequestSpec(
+        path=str(item["path"]),
+        method=str(item.get("method", DEFAULT_SMOKE_METHOD)).upper(),
+        body=str(item["body"]) if item.get("body") is not None else None,
+        headers=headers,
+        expect_status=int(item.get("expect_status", DEFAULT_SMOKE_EXPECT_STATUS)),
+        expect_body_contains=(
+            str(item["expect_body_contains"]) if item.get("expect_body_contains") else None
+        ),
+        name=str(item["name"]) if item.get("name") else None,
+    )
+
+
+def _parse_smoke(raw: object) -> list[SmokeRequestSpec]:
+    if not isinstance(raw, list):
+        return []
+    return [spec for item in raw if (spec := _parse_smoke_spec(item)) is not None]
+
+
+def _parse_backend_config(data: dict[str, object]) -> BackendConfig | None:
+    backend = data.get("backend")
+    if not isinstance(backend, dict) or not backend.get("start") or not backend.get("health_url"):
+        return None
+    return BackendConfig(
+        start=str(backend["start"]),
+        health_url=str(backend["health_url"]),
+        ready_timeout_seconds=int(
+            backend.get("ready_timeout_seconds", DEFAULT_BACKEND_READY_TIMEOUT_SECONDS)
+        ),
+        migrate=str(backend["migrate"]) if backend.get("migrate") else None,
+        smoke=_parse_smoke(backend.get("smoke")),
+    )
+
+
 def _parse_services(raw: object) -> list[ServiceSpec]:
     if not isinstance(raw, list):
         return []
@@ -290,4 +379,5 @@ def load_config(worktree: Path) -> VerdictConfig:
         token_pricing=_parse_token_pricing(data),
         frontend=_parse_frontend_config(data),
         services=_parse_services(data.get("services")),
+        backend=_parse_backend_config(data),
     )
