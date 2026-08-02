@@ -39,7 +39,7 @@ from verdict.runner import DEFAULT_MAX_ERROR_RETRIES, grade_existing_diff, run_w
 from verdict.sandbox import ResourceLimits, SandboxConfig
 from verdict.sandbox.base import SandboxUnavailableError
 from verdict.schema import ConfigResult, TaskRun, VerdictStatus
-from verdict.suite import BenchConfig, SuiteLoadError, load_suite, run_suite
+from verdict.suite import BenchConfig, LocalProcessPoolExecutor, SuiteLoadError, load_suite, run_suite
 from verdict.worktree import WorktreeError
 
 app = typer.Typer(add_completion=False, help="Grade AI coding agents on executable truth.")
@@ -412,6 +412,22 @@ def bench_cmd(
     health_timeout_seconds: int = typer.Option(
         30, "--health-timeout-seconds", help="How long a declared service gets to pass its health check."
     ),
+    max_workers: int = typer.Option(
+        1,
+        "--max-workers",
+        help=(
+            "How many (config, task) pairs to grade concurrently, each in its own worktree/sandbox. "
+            "1 (default) runs serially, in this process, exactly as before Phase 15."
+        ),
+    ),
+    cost_ceiling_usd: float = typer.Option(
+        0.0,
+        "--cost-ceiling-usd",
+        help=(
+            "Global spend cap across every (config, task) pair in this run. 0 disables it. "
+            "Cooperative, not preemptive — see DESIGN.md's Phase 15 section."
+        ),
+    ),
 ) -> None:
     """Run every --agent against every task in --suite, then print a
     pass-rate-per-dollar leaderboard and a failure-mode breakdown.
@@ -432,12 +448,20 @@ def bench_cmd(
         health_timeout_seconds,
     )
 
+    if max_workers < 1:
+        raise typer.BadParameter("--max-workers must be >= 1")
+    executor = LocalProcessPoolExecutor(max_workers=max_workers) if max_workers > 1 else None
+
     results = run_suite(
         tasks,
         configs,
         max_attempts=max_attempts,
         sandbox_config=sandbox_config,
         max_error_retries=max_error_retries,
+        executor=executor,
+        # 0 means "no ceiling" at the CLI layer, same spelling
+        # `--attempt-budget-seconds` already uses for its own None-disables knob.
+        cost_ceiling_usd=cost_ceiling_usd if cost_ceiling_usd > 0 else None,
     )
 
     if "cli" in report:
