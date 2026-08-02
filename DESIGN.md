@@ -2990,3 +2990,166 @@ defaulting to deny-all without the key).
   phase needs a second trusted-vs-repo-controlled setting, it'll likely
   want to generalize this rather than copy it a third time — noted, not
   built.
+
+## Phase 13 — Held-Out Acceptance Tests
+
+## The problem, restated
+
+Phase 12 defended against an agent gaming the tests it can see. It never
+addressed the case one layer up: a task whose VISIBLE suite doesn't cover
+the thing the task actually asked for. "Add retry logic to the HTTP
+client" against a repo whose existing tests never call the retry path can
+be "finished" by doing absolutely nothing — every PROVEN signal, integrity
+included, reports clean, because there is nothing in the repo that could
+possibly report otherwise. Passing the existing suite was never proof
+that net-new work happened; it was only ever proof that nothing already-
+tested broke. Phase 13 gives Verdict a way to actually assert the
+positive claim, the same way SWE-bench does: a task can ship held-out
+tests the agent never sees, applied only after it's finished, and grading
+requires them to pass.
+
+## The on-disk format, proposed before writing any grading code
+
+Per the phase's own instruction, the format was designed and written down
+(`acceptance.py`'s module docstring carries the canonical version) before
+any of the grading logic below was implemented. The shape:
+
+```text
+my_suite/add-retry-logic/
+  task.yml           # + fail_to_pass: [...], pass_to_pass: [...]
+  tests.patch         # a real `git diff --no-color`, NOT copied into repo/
+  repo/               # the agent's actual, patch-free starting point
+```
+
+Two new optional `task.yml` keys, `fail_to_pass`/`pass_to_pass` — each a
+list of pytest node ids, spelled exactly the way `gates/test.py`'s own
+`_node_id` already reconstructs them for attribution (`path/to/
+test_x.py::test_name`), so a benchmark author who already has junit output
+in front of them doesn't need to reformat anything. A sibling file,
+`tests.patch`, holds a plain unified diff (exactly what `git apply`
+already accepts, no custom format invented) that adds or modifies whatever
+test files those node ids live in.
+
+**Why a patch file, not a `hidden_tests/` directory of whole files** — the
+other option seriously considered before writing code: a directory can't
+express "add one more test function to an EXISTING visible test file"
+without either duplicating that file's other content or inventing a merge
+policy for combining a hidden copy with the agent's own edits to the same
+file. A unified diff applies on top of whatever's already there — new
+file or existing one — the same way any other patch does, so this case
+falls out for free rather than needing special-casing. It also happens to
+be exactly what SWE-bench's own dataset format already ships, which was
+the second, smaller reason: a benchmark author converting an existing
+SWE-bench-style task doesn't need to reshape anything, just copy `test_
+patch` over as `tests.patch` and read off `FAIL_TO_PASS`/`PASS_TO_PASS`
+into the equivalent `task.yml` keys.
+
+`tests.patch` is read by `suite/loader.py` at suite-LOAD time — before any
+agent worktree exists, the identical trust-boundary timing Phase 12's
+`allow_test_changes` already established — and is never copied into
+`repo/`. The agent's worktree is a checkout of `repo/` alone; it has no
+path through which it could read, edit, or delete a test it's about to be
+judged against, which is a stronger guarantee than Phase 12's integrity
+gate can offer for the visible suite (that one can only *detect*
+tampering after the fact; this one makes tampering structurally
+impossible by never exposing the target at all).
+
+## Grading semantics: what actually runs, and when
+
+`acceptance.py::check_acceptance` — called once per attempt, in `runner.
+run()`, right after Phase 12's integrity check, in its OWN fresh `scratch_
+worktree`/sandbox at the agent's `attempt_commit` (never the agent's own
+worktree — applying `tests.patch` mutates the working tree, and every
+check that already ran against that worktree would be contaminated by a
+patch it never expected):
+
+1. Apply `tests.patch` to the scratch worktree. A patch that doesn't apply
+   cleanly (the agent's own edits conflicted with a file the hidden tests
+   touch, or the patch is stale) is a real, evaluable outcome — a PROVEN
+   `acceptance` FAIL with the git error in `detail`, never an ERROR and
+   never silently ignored.
+2. Run `pytest` scoped to EXACTLY the declared node ids (`FAIL_TO_PASS` +
+   `PASS_TO_PASS` together, one invocation) — not the whole suite. Parsing
+   reuses `gates/test.py`'s own `_node_id` (imported, not re-derived) to
+   map junit's `classname`/`name` back to the same node-id spelling
+   `task.yml` was written in.
+3. Every declared id must come back a real pytest PASS. FAIL, ERROR,
+   `<skipped>`, and "never appeared in the junit report at all" (a typo'd
+   node id, or a test the patch was supposed to add but didn't) are all
+   treated identically — not-PASS fails the whole signal, no partial
+   credit.
+
+**Deliberately NOT re-verified**: that a `FAIL_TO_PASS` id actually fails
+against the unpatched base commit at grading time. That's the benchmark
+author's responsibility at task-authoring time (the name is a promise
+about the dataset, not a runtime assertion); re-deriving it here would
+cost a second full sandboxed run per grading pass, for a check whose
+only purpose is catching a malformed benchmark task, not grading an
+agent. SWE-bench's own harness makes the identical simplification for the
+identical reason.
+
+**`SandboxError` while provisioning the scratch sandbox is deliberately
+NOT caught** inside `check_acceptance` — the one place this module departs
+from Phase 12's coverage sub-check, which IS explicitly best-effort and
+swallows failures. Acceptance is the authoritative signal once a task
+declares it; degrading silently on infra trouble would mean exactly the
+"quietly report success anyway" failure mode Phase 11's `ERROR` status
+exists to prevent. It propagates to `runner.py`'s ordinary `_EVALUATION_
+ERRORS` handling instead — retried, then reported `ERROR`, like any other
+infra failure, never treated as an implicit PASS.
+
+## Why "acceptance" can force NOT_DONE with no schema change, again
+
+Same fact Phase 12 already established and leaned on: `Verdict.status`'s
+FAIL check (`schema.py`) has never inspected `Signal.name`, only
+`provenance`/`status`. A `Signal(name="acceptance", provenance=PROVEN,
+status=FAIL)` forces `NOT_DONE` through the exact same generic path a
+real `test` FAIL or Phase 12's `integrity` FAIL already do. Confirmed, not
+assumed: `test_visible_suite_passes_but_held_out_fail_to_pass_fails_is_
+not_done` (`tests/test_acceptance.py`) builds a repo whose visible suite
+is `assert True` — genuinely, structurally unable to fail — runs a
+no-op agent through the real `runner.run()` pipeline with a held-out
+`FAIL_TO_PASS` test still failing, and asserts `verdict.status is NOT_
+DONE` even though the `test` signal itself reports PASS.
+
+## How this resolves Phase 12's open problem
+
+Phase 12's own DESIGN.md section named the tradeoff explicitly: a
+strict-by-default integrity gate flags even a legitimate "add tests for
+X" task, and the mitigation shipped then (`TestChangeAllowance`, a
+task-declared, trust-boundary-guarded exception) was documented as
+interim — "once acceptance lives in tests the agent can't see or edit,
+gaming the visible tests stops mattering for grading purposes." Phase 13
+is that promise kept, not a new mechanism bolted on top of the old one:
+a task with real `fail_to_pass`/`pass_to_pass` tests doesn't need
+`allow_test_changes` at all, because the tests that actually decide
+DONE/NOT_DONE were never in the agent's worktree to edit in the first
+place. The two mechanisms stay independent (Phase 12's integrity gate
+still watches the visible suite when it exists — worth a human's
+attention even when it isn't decisive) rather than one replacing the
+other in code; a benchmark author picks whichever fits a given task, or
+both.
+
+## What's explicitly out of scope for Phase 13
+
+- **Non-pytest acceptance** — `check_acceptance` only knows how to run
+  targeted pytest node ids. A Jest/Go task can't declare `fail_to_pass`/
+  `pass_to_pass` yet; doing so is real, valuable follow-on work structured
+  the same way `gates/test.py` already handles multiple tools, just not
+  built this phase.
+- **Re-verifying `FAIL_TO_PASS` fails at the base commit** — see above;
+  a benchmark-authoring-time responsibility, not a grading-time check.
+- **`verdict gate`/`grade_existing_diff`** — no task directory exists in
+  merge-gate mode to source a `tests.patch` from, so acceptance checking
+  isn't wired in there at all, the same scoping Phase 12's `allow_test_
+  changes` CLI flag drew for that command's other new capability.
+- **Caching the scratch-worktree/sandbox acceptance run** — unlike Phase
+  10's base-state cache (keyed on a `base_commit` many callers share
+  across a run), an acceptance check's inputs (`attempt_commit` +
+  `tests.patch`) are unique to one attempt by construction, so there's no
+  reuse value the caching machinery elsewhere in this codebase exists to
+  capture.
+- **Suite-authoring tooling** — no `verdict suite generate-patch` or
+  similar helper for producing `tests.patch` from a scratch checkout; a
+  benchmark author runs `git diff` themselves, per this phase's own
+  format docstring.
