@@ -3779,3 +3779,239 @@ simulated transport failure, asserting all three buckets land correctly.
   PROVEN/JUDGED split is treated as the load-bearing defense and these
   prompt-level measures as hardening on top of it, not a claim of
   completeness.
+
+## Phase 17 — Persisted History and Regression Detection
+
+## The problem, restated
+
+Every phase through Phase 16 is stateless across invocations: `verdict
+run`/`bench`/`gate` compute a `list[ConfigResult]`, print it, optionally
+write a JSON/HTML file, and forget everything the moment the process
+exits. `report_json.py`'s own docstring names the gap explicitly — the
+JSON envelope exists so "a consumer (... a future dashboard ...) has one
+stable top-level shape to parse," a future this phase is. Nothing before
+now answers "is this PR's pass rate actually worse than usual, or does
+this task just fail one run in five" — Phase 7 built the right statistical
+tool for that question (a pooled two-proportion z-test) but had nothing
+to compare against except two `--json` files a caller happened to have
+lying around. Phase 17 is what closes both gaps: a place for runs to
+live, and a way to ask that stored history a real statistical question.
+
+## The `Store` Protocol, and why SQLite
+
+`store/base.py` defines `Store` the same way `Sandbox` (Phase 8) and
+`Executor` (Phase 15) were defined before it: one Protocol, callers code
+against it, a concrete backend is swappable without touching anything
+downstream. Four methods — `record_run`, `history`, `runs`,
+`get_config_results` — is deliberately the whole surface; nothing in this
+phase needed more than "write a run," "read a task's history," "list what
+exists," "read a run back in full."
+
+`SQLiteStore` is the one implementation, built on the standard library's
+own `sqlite3` — no new dependency, the same choice Phase 14's backend
+smoke checks and Phase 16's `AnthropicVisionTransport` already made for
+their own "don't reach for a package when the standard library already
+does the job" moments. SQLite specifically (over, say, appending to a
+JSON-lines file) because `regression.py`'s entire job is "look up this
+exact `(task, agent, repo, config_label)` combination's history fast" —
+`idx_task_outcomes_lookup` makes that a single indexed query instead of
+an O(n) scan over every run this project has ever recorded, the same
+reason Phase 10's base-state cache uses a keyed directory layout instead
+of one flat blob.
+
+## What actually gets persisted, and why nothing new for artifacts
+
+`record_run` writes a full `ConfigResult` — every `TaskRun`, every
+`Verdict`, every `Signal` — as JSON, verbatim (`ConfigResult.
+model_dump_json()`/`model_validate_json()`, the same round-trip
+`report_json.py` already relies on). This is the direct answer to
+"persist artifact references — screenshots, videos, logs": `Signal.
+artifact_path` (Phase 4's glitch-scan recordings), `Signal.cost_usd`
+(Phase 16), every gate's `detail`/`failures` — all of it is already part
+of that nested tree, so storing the `ConfigResult` whole means storing
+every artifact *reference* along with it, with no separate artifact table
+or new schema needed. What's deliberately NOT stored is the artifact's
+own bytes — a screenshot or a `.webm` recording stays wherever the run
+already wrote it (a temp capture directory, Phase 4's retention-on-
+failure policy unchanged); the store only ever holds the path string that
+already pointed at it. Copying binary artifacts into a SQLite blob column
+would be a real, separate feature (retention policy, size caps,
+garbage collection) this phase wasn't asked to build.
+
+Alongside the full JSON, `record_run` also writes one denormalized
+`task_outcomes` row per `TaskRun` — `(task, agent, repo, config_label,
+done, status, recorded_at, commit_sha)` — for the same reason Phase 2
+kept `FailureLocation` structured instead of only living inside `detail`
+text: `history()`/`regression.py` need exactly this shape, repeatedly,
+and re-deriving it by deserializing a full nested `ConfigResult` on every
+query would be needless work for data that's already known at write time.
+
+## Regression detection: literally the Phase 7 z-test, no new statistics
+
+This is the part of the brief worth calling out on its own, because the
+reuse is exact, not "inspired by": `flakiness.compare_flakiness` takes
+two `FlakinessResult`s — each just a `(task, agent, repo, trials,
+passes)` tuple with a label — and runs a pooled two-proportion z-test
+between them, classifying the gap as `REGRESSION`/`IMPROVEMENT`/`NOISE`.
+Phase 7 built `trials`/`passes` by running the same task N times *in one
+sitting*. `store/regression.py::detect_regressions` builds the identical
+shape from N *historical runs recorded over time* instead — pool the
+`baseline_window` most recent prior `TaskOutcome`s into a baseline
+`FlakinessResult` (`trials = len(outcomes)`, `passes = count where
+done`), treat the run being evaluated as a one-trial candidate
+`FlakinessResult`, and call `compare_flakiness` completely unmodified.
+No new significance test, no new p-value math, no new "is this real"
+judgment call — the exact same honest "NOISE unless the gap clears
+`alpha`" discipline that already stops flakiness detection from crying
+wolf over a small sample now stops a single flaky historical blip from
+lighting up a dashboard red.
+
+**Why the candidate is a one-trial sample, not itself a window.** A
+`verdict bench`/`gate` invocation normally grades each `(config, task)`
+pair exactly once — `n=1` is the honest sample size for "the run being
+evaluated right now," and a two-proportion z-test is still valid math at
+`n=1`, just lower-powered (a single new outcome needs the baseline to be
+fairly one-sided before the gap clears significance). That's a feature,
+not a compromise: it's exactly the "don't cry wolf over noise" property
+Phase 7 already prized, now automatically applied to the weakest possible
+sample size instead of needing a separate small-sample special case.
+
+**Why a task with no prior history is silently skipped, never reported
+as anything.** "No baseline exists yet" and "compared against a baseline
+and found no regression" are different claims — `detect_regressions`
+only ever returns the second kind, matching this codebase's running
+"unknown stays unknown" rule (`TaskRun.total_cost_usd`'s `None`-on-
+unknown, `ConfigResult.pass_rate_per_dollar`'s refusal to divide by an
+unknown cost, `FlakinessComparison`'s own NOISE-not-a-guess verdict). A
+brand-new task in a freshly-created `--store` produces zero regressions
+on its first ever run, honestly, rather than a manufactured "no data =
+fine" verdict dressed up as a real comparison.
+
+**`baseline_window` (default 20), not "all of history."** An agent/repo
+pair with hundreds of recorded runs shouldn't have five recent failures
+diluted into invisibility by five hundred old clean ones — a bounded,
+recent window is what "compare against a historical baseline" actually
+means for a target that's expected to drift over time (agent versions
+change, models change), not a fixed ground truth.
+
+## Regression detection never changes an exit code
+
+`_persist_run` (`cli.py`) prints every flagged `TaskRegression` loudly
+(red, prefixed `[REGRESSION]`, the comparison's p-value and both pass
+rates shown) but never touches `sys.exit`. This is a direct extension of
+Phase 7's own explicit stance, restated for the identical reason:
+*"there's no CI step where a statistical signal should silently block a
+merge the way a failing PROVEN gate does."* `verdict gate`'s exit code
+stays governed purely by whether THIS diff's PROVEN checks passed — a
+historical trend is real, worth a human's attention, and printed
+prominently, but conflating "the diff under review has an executed
+failure" with "this task has been getting flakier over the last 20 runs"
+would blur two different kinds of evidence this codebase has kept
+deliberately distinct since Phase 0 (PROVEN vs. everything else).
+
+## CLI: opt-in persistence, a new `history` command group
+
+`--store PATH` is a new, optional flag on `bench`/`gate` — omitted (the
+default) means zero behavior change from before this phase, the same
+"off unless asked for" posture every other side-effecting flag in this
+CLI already takes (`--max-attempts`, `--cost-ceiling-usd`, Phase 15's
+`--max-workers`). When given, the run's results are persisted
+(`--commit-sha`/`--run-label` optionally tag it; `gate` auto-fills
+`--commit-sha` via `git rev-parse HEAD` in `--repo` when not given
+explicitly, since a gate check always has exactly one obvious commit to
+attribute itself to) and checked for regressions against history before
+anything renders.
+
+`verdict history` is this codebase's first `typer` sub-app — `list`
+(recorded runs, or one task's outcome trend when `--task`/`--agent`/
+`--repo` are all given) and `compare` (re-run regression detection
+against an already-recorded `--run-id`, without re-grading anything).
+`history compare` calls the exact same `detect_regressions` `bench`/
+`gate` call inline — one implementation of "is this a regression,"
+whether triggered live during a run or retroactively against a past one.
+
+## The HTML dashboard: trend sparklines, linked artifacts
+
+`report_html.py` gains an optional `history` parameter — a `{(config_
+label, task, agent, repo): list[TaskOutcome]}` dict a caller (`cli.py`)
+builds from `Store.history(...)` calls, one per task. `render_html`
+itself still never imports or queries a `Store` directly (only
+`TaskOutcome`, the slim read-only projection type) — the exact same
+separation `economics.py`/`failure_modes.py` already keep from whatever
+produced the `ConfigResult`s they render, now extended one layer further.
+`None` (the default, every pre-Phase-17 call site including every
+existing test) renders exactly the report this function always produced;
+a "History" section only appears when a caller opts in.
+
+Each `(config, task)` row renders a small inline `<svg>` sparkline — one
+dot per recorded run, oldest to newest left to right, green for done/red
+for not, connected by a line — self-contained markup with no JS and no
+external image request, the same "safe to open from disk, safe as a bare
+CI artifact" constraint every other part of this file already holds
+itself to. A task with no recorded history renders "no history" rather
+than an empty or misleading chart.
+
+Separately, `Signal.artifact_path` — previously rendered as plain text
+("recording: /path/to/video.webm") — is now a real `<a href>` link. Still
+a local filesystem path, not a remote fetch (no change to the "no
+external requests" constraint), but a reviewer can now click through to a
+glitch-scan recording or a screenshot directly from the report instead of
+copying a path out and opening it by hand.
+
+## Tests
+
+- `tests/test_store.py` — `SQLiteStore` round-trips a full `ConfigResult`
+  tree exactly (verdicts, signals, cost, and an `artifact_path`
+  reference survive intact); `history()`'s ordering/`config_label`
+  filter/`exclude_run_id` filter/`limit`, each tested directly;
+  `runs()` lists most-recent-first with correct `config_labels`.
+  `detect_regressions`: a clear break from 20 clean historical runs is
+  flagged with `p_value < 0.05`; a single new failure against an already
+  -noisy 4-run history is NOT flagged (still NOISE); a task with zero
+  prior history produces no regression report at all; an IMPROVEMENT is
+  never reported as a regression; a just-recorded run's own outcome is
+  proven excluded from its own baseline via `exclude_run_id`; a bounded
+  `baseline_window` is proven not to reach past itself into older data.
+- `tests/test_reporters.py` gained cases for the HTML dashboard: the
+  History section is absent by default (no behavior change for existing
+  callers), present and correctly summarized (`"4/5"`) when `history=` is
+  supplied, and renders "no history" for a task with none;
+  `Signal.artifact_path` renders as a real `<a class="artifact"
+  href="...">` instead of plain text.
+- Manually verified end-to-end against a real SQLite file: `verdict
+  bench --store` across two separate invocations, `verdict history list`
+  (both the run-listing and task-trend-listing forms), `verdict history
+  compare`, and an HTML report with a real rendered sparkline — see this
+  phase's own review notes for the transcript.
+
+## What's explicitly out of scope for Phase 17
+
+- **A second `Store` backend.** The Protocol is built so one is a new
+  class, not a rewrite (mirroring `Sandbox`/`Executor`), but only
+  `SQLiteStore` ships.
+- **Persisting artifact bytes, not just references.** See "What actually
+  gets persisted" above — a screenshot/video/log's own content stays
+  wherever it was already written; the store only ever holds the path
+  that already pointed at it. No retention policy, size cap, or garbage
+  collection for a store's growth over time either — `SQLiteStore`'s
+  file simply accumulates, the same deferred-not-forgotten stance Phase
+  10's base-state cache took for its own `~/.cache/verdict/` directory.
+- **Any CI gate on a historical regression.** See "Regression detection
+  never changes an exit code" above — informational only, by explicit
+  design, mirroring Phase 7's identical stance on calibration/flakiness.
+- **Cross-machine/concurrent-writer SQLite usage.** `SQLiteStore` opens a
+  short-lived connection per operation, which is correct for the
+  single-process-at-a-time way `verdict bench`/`gate` actually use it,
+  but there's no WAL-mode tuning or retry-on-lock handling for multiple
+  processes hammering the same db file concurrently (e.g. several CI
+  runners sharing one store) — a real, deferred concern, not a hidden
+  correctness gap for this phase's actual usage pattern.
+- **Trend visualization beyond a per-task sparkline.** No aggregate
+  "pass rate over time" chart across a whole config, no cost-over-time
+  trend, no UI for browsing history beyond the CLI's `history list` and
+  the dashboard's per-task rows.
+- **Auto-detecting `--commit-sha` for `bench`.** `gate` has exactly one
+  repo and auto-fills it from `git rev-parse HEAD`; `bench` grades a
+  whole suite of independently-versioned task repos, so there's no single
+  "the" commit to auto-derive — `--commit-sha` stays a caller-supplied,
+  free-form string there.
