@@ -162,6 +162,24 @@ def changed_files(repo: Path, a: str, b: str) -> list[str]:
     return [line for line in out.splitlines() if line]
 
 
+def file_content_at(repo: Path, ref: str, path: str) -> str | None:
+    """`path`'s content at `ref`, or `None` if it doesn't exist there —
+    Phase 12's integrity check reads a test file's before/after content
+    this way (`git show <ref>:<path>`) rather than checking anything out,
+    since it only needs to compare text, never to actually run either
+    version.
+    """
+    result = subprocess.run(
+        ["git", "show", f"{ref}:{path}"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
 def checkout_path_from(worktree_path: Path, commit: str, path: str) -> bool:
     """Overwrite `path` in `worktree_path` with its content at `commit`,
     handling the case where `path` doesn't exist at `commit` (i.e. it was

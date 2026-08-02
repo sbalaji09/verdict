@@ -56,6 +56,12 @@ def _run_task(
         max_attempts=max_attempts,
         sandbox_config=sandbox_config,
         max_error_retries=max_error_retries,
+        # Phase 12: the task's OWN `allow_test_changes` — sourced from
+        # `task.yml` by `suite/loader.py`, the trusted side of the
+        # boundary `integrity.TestChangeAllowance` documents. Never a
+        # suite-wide override here; each task's own declaration is what
+        # governs it.
+        allow_test_changes=task.allow_test_changes,
     )
 
 

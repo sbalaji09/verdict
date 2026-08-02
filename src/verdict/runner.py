@@ -13,6 +13,7 @@ from verdict.attribution.engine import attribute_failures
 from verdict.config import VerdictConfig, load_config
 from verdict.frontend.runner import run_frontend_checks
 from verdict.gates.registry import run_all_gates
+from verdict.integrity import DENY_ALL, TestChangeAllowance, check_test_integrity
 from verdict.sandbox import Sandbox, SandboxConfig, create_sandbox
 from verdict.sandbox.base import SandboxError
 from verdict.sandbox.install import run_setup_step
@@ -92,6 +93,7 @@ def run(
     repo: Path,
     adapter: Adapter,
     sandbox_config: SandboxConfig | None = None,
+    allow_test_changes: TestChangeAllowance | None = None,
 ) -> Verdict:
     """Run `adapter` on `task` inside a throwaway worktree of `repo`, grade
     the result against every applicable gate (test/typecheck/build/lint),
@@ -111,8 +113,18 @@ def run(
     section), then language-version pins are resolved and dependencies
     installed (`run_setup_step`), producing an env overlay every
     subsequent gate call gets merged into.
+
+    `allow_test_changes` (Phase 12) defaults to `None`, resolved to
+    `integrity.DENY_ALL` below — NOT to some lenient default — so a
+    caller that forgets to pass one gets the strict behavior. See
+    `TestChangeAllowance`'s own docstring for exactly which callers are
+    trusted to pass something else, and why `run()` itself accepts
+    whatever it's given without knowing (or needing to know) which of
+    those trusted sources it came from — that policy decision belongs to
+    the caller, not here.
     """
     sandbox_config = sandbox_config or SandboxConfig()
+    allowance = allow_test_changes or DENY_ALL
     deadline = _budget_deadline(sandbox_config)
 
     with isolated_worktree(repo) as worktree:
@@ -159,11 +171,12 @@ def run(
                     setup_env,
                 )
 
-                # Frontend checks run after gates/attribution, and their signals are
-                # appended afterward rather than folded into `signals` beforehand —
-                # attribution's bisector only knows the four gate names in
-                # gates/registry.py's GATE_RUNNERS, and would crash trying to
-                # `resolve_gate("frontend:...")`. A failing frontend check is real
+                # Frontend and integrity checks run after gates/attribution, and
+                # their signals are appended afterward rather than folded into
+                # `signals` beforehand — attribution's bisector only knows the
+                # four gate names in gates/registry.py's GATE_RUNNERS, and would
+                # crash trying to `resolve_gate("frontend:...")`/
+                # `resolve_gate("integrity", ...)`. A failing check here is real
                 # PROVEN evidence for Verdict.status either way; it's just not
                 # (yet) bisectable to a culprit file the way test/typecheck/build/
                 # lint failures are.
@@ -173,6 +186,18 @@ def run(
                     signals = signals + run_frontend_checks(
                         repo, worktree, config, task, sandbox=sandbox, sandbox_config=sandbox_config
                     )
+                    integrity_signal = check_test_integrity(
+                        repo=repo,
+                        base_commit=worktree.base_commit,
+                        final_commit=attempt_commit,
+                        final_worktree_path=worktree.path,
+                        final_signals=signals,
+                        allowance=allowance,
+                        sandbox_config=sandbox_config,
+                        sandbox=sandbox,
+                        env=setup_env,
+                    )
+                    signals = signals + [integrity_signal]
         finally:
             teardown_services(service_session)
 
@@ -232,7 +257,10 @@ def _run_gates_and_attribution(
 
 
 def grade_existing_diff(
-    repo: Path, base_ref: str, sandbox_config: SandboxConfig | None = None
+    repo: Path,
+    base_ref: str,
+    sandbox_config: SandboxConfig | None = None,
+    allow_test_changes: TestChangeAllowance | None = None,
 ) -> Verdict:
     """Grade `repo` exactly as it's already checked out against `base_ref`
     — no adapter, no worktree isolation. This is Phase 6's merge-gate entry
@@ -273,6 +301,7 @@ def grade_existing_diff(
     # through this path itself.
     worktree = Worktree(path=repo, branch="HEAD", base_commit=base_commit)
     sandbox_config = sandbox_config or SandboxConfig()
+    allowance = allow_test_changes or DENY_ALL
     deadline = _budget_deadline(sandbox_config)
 
     config = load_config(repo)
@@ -290,6 +319,17 @@ def grade_existing_diff(
                     repo, worktree, config, task="pull request diff", sandbox=sandbox,
                     sandbox_config=sandbox_config,
                 )
+                integrity_signal = check_test_integrity(
+                    repo=repo,
+                    base_commit=base_commit,
+                    final_commit=final_commit,
+                    final_worktree_path=repo,
+                    final_signals=signals,
+                    allowance=allowance,
+                    sandbox_config=sandbox_config,
+                    sandbox=sandbox,
+                )
+                signals = signals + [integrity_signal]
     finally:
         teardown_services(service_session)
 
@@ -338,6 +378,7 @@ def _run_attempt(
     adapter: Adapter,
     sandbox_config: SandboxConfig | None,
     max_error_retries: int,
+    allow_test_changes: TestChangeAllowance | None,
 ) -> list[Verdict]:
     """One logical attempt at `task`, with bounded automatic retry ONLY
     for `_EVALUATION_ERRORS` — infra that raised instead of returning a
@@ -355,7 +396,15 @@ def _run_attempt(
     verdicts: list[Verdict] = []
     for _ in range(max(max_error_retries, 0) + 1):
         try:
-            verdicts.append(run(task=task, repo=repo, adapter=adapter, sandbox_config=sandbox_config))
+            verdicts.append(
+                run(
+                    task=task,
+                    repo=repo,
+                    adapter=adapter,
+                    sandbox_config=sandbox_config,
+                    allow_test_changes=allow_test_changes,
+                )
+            )
             return verdicts
         except _EVALUATION_ERRORS as exc:
             verdicts.append(_error_verdict(task, adapter.name, repo, exc))
@@ -369,6 +418,7 @@ def run_with_retries(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     sandbox_config: SandboxConfig | None = None,
     max_error_retries: int = DEFAULT_MAX_ERROR_RETRIES,
+    allow_test_changes: TestChangeAllowance | None = None,
 ) -> TaskRun:
     """Attempt `task` up to `max_attempts` times, stopping early on the
     first DONE. Every attempt is kept — including failed, abandoned ones —
@@ -391,7 +441,9 @@ def run_with_retries(
     """
     attempts: list[Verdict] = []
     for _ in range(max(max_attempts, 1)):
-        attempts.extend(_run_attempt(task, repo, adapter, sandbox_config, max_error_retries))
+        attempts.extend(
+            _run_attempt(task, repo, adapter, sandbox_config, max_error_retries, allow_test_changes)
+        )
         latest = attempts[-1]
         if latest.done or latest.status is VerdictStatus.ERROR:
             break
