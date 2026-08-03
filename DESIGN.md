@@ -4440,3 +4440,248 @@ always being the worktree root.
   its packages explicitly in `verdict.yml`; teaching `monorepo.py` to read
   a `package.json` workspaces glob is a plausible, separable follow-up,
   not required by this phase's own brief.
+
+---
+
+## Phase 20 — The Credibility Capstone: Is Verdict Right?
+
+## The question every prior phase assumed the answer to
+
+Nineteen phases have all optimized the same machine: better gates, causal
+attribution, cost accounting, frontend truth, sandboxing, retries, history,
+monorepos. Every one of them takes for granted that `Verdict.status` itself
+— DONE, NOT_DONE, UNVERIFIED — is the right answer once it's computed.
+Nothing before this phase ever checked that assumption against an outside
+source. Phase 7 asked exactly this question one level down, for the one
+JUDGED signal in the codebase (`calibration.py`, "is the vision judge's
+opinion any good"), and answered it by running the judge over a human-
+labeled sample and reporting concordance. Phase 20 asks the same question
+about the tool's own headline number: *when Verdict says DONE, is the work
+actually done?* This is deliberately the last phase, because it's only
+answerable once there's a whole pipeline worth pointing at — and it's the
+phase that turns "trust us" into "here's the confusion matrix."
+
+## Reusing Phase 7, not re-deriving it
+
+`ground_truth.py` shares Phase 7's exact discipline rather than inventing
+a parallel one:
+
+- **`DatasetLoadError` is imported directly from `calibration.py`, not
+  redefined.** A malformed manifest is the same class of problem whether
+  the examples are screenshots or task attempts — eager, load-time
+  validation with a clear message, never a confusing failure mid-run.
+- **Store raw counts, compute derived stats, `None` beats a fabricated
+  number.** `GroundTruthResult.accuracy`/`per_class`/`macro_f1` are
+  `@computed_field`s over stored counts, exactly like
+  `CalibrationResult.concordance` — `None` when there's nothing to divide
+  by (`graded == 0`, or a class neither humans nor Verdict ever produced
+  in the sample), never a `0.0` or `1.0` that looks precise while being
+  fabricated.
+- **Every disagreement kept individually, not just the aggregate.**
+  `GroundTruthDisagreement` mirrors `calibration.Disagreement` field for
+  field (`rationale` there ↔ `detail` here) — a 50% accuracy score alone
+  tells a reader "something's off"; the disagreement table tells them
+  *which case* and *why*, the same "point at the evidence" instinct behind
+  `Attribution.explanation`.
+- **Never exits non-zero.** `verdict ground-truth` warns below threshold,
+  same as `verdict calibrate` — a below-target score here is diagnostic
+  information a team acts on deliberately (fix the harness, add a gate,
+  accept the limitation), not a build to fail; `verdict gate` (Phase 6)
+  remains the only command whose exit code blocks a merge.
+- **`unavailable` becomes `errored`.** Calibration's "the judge had no
+  opinion at all" bucket has a direct analogue here: a `Verdict` that comes
+  back `ERROR` (infra couldn't evaluate the attempt) isn't a judgment about
+  the work a human could agree or disagree with, so it's tallied under
+  `errored`/`errored_examples` and excluded from the confusion matrix
+  entirely — never silently counted as either an agreement or a
+  disagreement.
+
+What's genuinely new, because the underlying question is genuinely
+different: Phase 7 measures a **binary** judge (pass/fail) against a
+binary human label, so one number (concordance) says everything there is
+to say. `Verdict.status` is **three-way** (DONE/NOT_DONE/UNVERIFIED,
+`VerdictStatus.ERROR` set aside — see below), so "agrees or not" becomes a
+genuine multi-class problem: a 3×3 confusion matrix, plus per-class
+precision/recall/F1 computed from it (`ClassMetrics`), plus a macro-
+averaged F1 as the single headline number a reader can compare across
+datasets. `precision(DONE)` answers "when Verdict says DONE, how often is
+a human's own DONE" — the single most important number for a team
+deciding whether to trust the tool's exit code.
+
+## What a "ground-truth example" actually is
+
+Not a screenshot — a `(repo, task, patch, human_label)` tuple:
+`GroundTruthExample` pairs a real git repo, a task description, a fixed
+`{relative_path: contents}` patch standing in for "the agent's attempt"
+(applied through `MockAdapter`, the exact same fixed-patch mechanism
+Phase 0 built so the pipeline could be exercised without a live agent
+call), and a human's own DONE/NOT_DONE/UNVERIFIED judgment of that
+attempt. `run_ground_truth` replays every example through the **real**
+`runner.run()` — genuine worktree isolation, genuine gates, genuine
+attribution, nothing mocked below the adapter — and compares the real
+`Verdict.status` to the human label. This was a deliberate choice over a
+cheaper synthetic comparison (hand-construct `Verdict` objects and diff
+their `.status` against a label): a synthetic harness would test the
+comparison arithmetic, but only running the genuine pipeline proves the
+thing actually being measured — the status this tool actually reports in
+production — is what the numbers are about. Every fixture below runs the
+real pipeline end to end, the same standard Phase 2's bisection tests hold
+themselves to and for the same reason.
+
+## A discovery this phase's own methodology surfaced: UNVERIFIED's reachability
+
+Building the first UNVERIFIED ground-truth case exposed something no
+earlier phase's tests happened to check: **through `run()`'s normal path,
+`VerdictStatus.UNVERIFIED` is reachable ONLY via `budget_exceeded`.**
+Phase 1's original design for UNVERIFIED was "zero PROVEN gates ran" — a
+repo with none of the four stacks detected. That was true through Phase
+11. Phase 12 then added `check_test_integrity`, which "always returns a
+real PROVEN `Signal`" (its own docstring's words) — PASS or FAIL, **never**
+NA. `Verdict.status`'s `_proven_applicable()` filters out NA signals but
+keeps everything else, so the moment integrity runs and passes (which it
+does on almost every attempt — nothing suspicious happened), `applicable`
+is never empty, and a repo with all four gates NA now resolves to DONE,
+not UNVERIFIED: the always-present integrity check quietly took over as
+"the one PROVEN signal keeping the verdict from being empty," a role it
+was never designed to play. `budget_exceeded=True` is the one remaining
+path, because `runner.py` skips the integrity check entirely when the
+budget's already gone (see Phase 9's section) — so an empty `applicable`
+list can still happen, just not for the reason Phase 1 described.
+
+This phase does **not** change that behavior. Reworking `_proven_
+applicable()` or excluding `integrity` from it would ripple into
+every phase's existing DONE/NOT_DONE/UNVERIFIED assertions (fourteen
+phases' worth of tests assert specific status semantics) for a change
+well outside "build a ground-truth harness" — a real fix, but a separate
+piece of surgery with its own review, not something to fold in here
+un-reviewed. What this phase *does* do is refuse to hide the finding: a
+credibility tool that quietly worked around its own subject's rough edge
+would defeat the entire point of building it. `examples/ground_truth_
+dataset/` accordingly ships four cases (DONE/DONE, NOT_DONE/NOT_DONE, and
+two genuine disagreements — see below) rather than forcing in an
+UNVERIFIED example that isn't honestly reproducible through the CLI's own
+`--attempt-budget-seconds` flag (0 there means "disabled," the opposite of
+what triggers UNVERIFIED at the `SandboxConfig` level — see `_build_
+sandbox_config`). The mechanism is still fully proven, deterministically,
+in `test_ground_truth.py`'s
+`test_run_ground_truth_agrees_on_unverified_when_nothing_had_a_chance_to_run`,
+using the exact same `SandboxConfig(attempt_budget_seconds=0)` construction
+`test_timeouts.py` already established for this — real coverage, just not
+force-fit into the polished CLI demo where it would need an unreliable
+flag value to reproduce.
+
+## The demo dataset: two agreements, two named disagreements, honestly
+
+`examples/ground_truth_dataset/` ships four cases, deliberately not a
+uniform "look how accurate we are" set — a demo whose only disagreement
+is a coin flip in the harness's favor teaches a reader nothing about the
+tool's real edges:
+
+| Case | Patch | Verdict | Human | Why |
+|---|---|---|---|---|
+| `clean-fix` | correctly fixes `add()` | DONE | done | agreement |
+| `still-broken` | edits an unrelated file, bug remains | NOT_DONE | not_done | agreement |
+| `preexisting-failure-blocks-a-real-fix` | correctly fixes `add()`; a second, unrelated, pre-existing test is still failing | NOT_DONE | **done** | disagreement |
+| `hardcoded-test-gaming` | special-cases the exact literal test input (`a==2 and b==3`) instead of fixing the general case | **DONE** | not_done | disagreement |
+
+Both disagreements are real, structural, and individually explained — not
+noise, and not a bug in either side:
+
+- **`preexisting-failure-blocks-a-real-fix`** (Verdict too strict): `Verdict.
+  status` fails the whole run the moment *any* PROVEN gate signal is FAIL,
+  with no notion of "this failure predates the task and is out of scope" —
+  that distinction exists in this codebase (Phase 2's `Attribution.kind ==
+  PRE_EXISTING`), but it only annotates *why* a failure happened, and was
+  deliberately never wired to *change* `Verdict.status` itself (see Phase
+  2's own design notes on keeping attribution's "why" separate from the
+  gate's raw pass/fail). A task-scoped human reviewer, told the second
+  failure is tracked separately, correctly calls the actual task done;
+  Verdict's whole-suite-scoped status can't make that distinction and
+  correctly (by its own rules) calls it NOT_DONE. Both answers are right,
+  to two different, equally real questions.
+- **`hardcoded-test-gaming`** (Verdict too lenient): the patch passes the
+  literal test by pattern-matching its exact input, the textbook Goodhart's-
+  law failure mode a PROVEN-only grading system is structurally unable to
+  catch — `Verdict` can only see that the test suite it was handed passed,
+  never that the fix doesn't generalize; that requires reading the diff for
+  intent, which is squarely outside what any executed, deterministic check
+  can tell you. A human glancing at the same one-line diff sees it
+  immediately. This is the single clearest illustration in the whole
+  project of *why* PROVEN/JUDGED is a floor, not a ceiling — a gap no
+  amount of adding more autodetected gates (Phase 1, Phase 19) can close,
+  because it isn't a coverage gap, it's a category one.
+
+Accuracy on this dataset is 50% (2/4) — not a target to chase up by
+cherry-picking easier cases, but an honest number for a deliberately
+small, adversarially-chosen sample that exists to demonstrate the
+*mechanism* and name real edges, the same spirit `examples/calibration_
+dataset`'s honest 75% concordance has carried since Phase 7. A team
+running this against their own, larger, more representative sample of
+real attempts would get a different, more meaningful number — the harness
+is what's being shipped here, not a specific accuracy claim about Verdict
+in general.
+
+## `verdict ground-truth`
+
+```text
+verdict ground-truth --dataset examples/ground_truth_dataset/manifest.json
+```
+
+Prints three tables — accuracy/macro-F1 summary, the 3×3 confusion matrix,
+per-class precision/recall/F1 — then every disagreement with its evidence,
+in that order: headline number first, full picture second, drill-down
+last, the same top-down structure `verdict run`'s own report already
+uses. Shares every sandbox flag `verdict run` has (`--sandbox-backend`,
+timeouts, resource limits) since each example is a real `run()` call
+underneath; `--threshold` (default 80%) is the accuracy bar
+`meets_threshold` warns against, `calibrate`'s `--threshold` renamed for
+this command's own metric.
+
+## Tests
+
+`tests/test_ground_truth.py` splits the same way `test_calibration.py`
+does: `ClassMetrics`/`GroundTruthResult` arithmetic (precision/recall/F1
+from known counts, the zero-denominator-stays-`None` discipline, threshold
+gating) asserted directly against hand-built confusion matrices;
+`load_ground_truth_dataset` tested against every malformed-manifest shape
+(missing key, empty patch, an unknown or `"error"` human_label, a `repo`
+that isn't a git repo, zero examples) to the same defensive-parsing
+standard `suite/loader.py` and `calibration.py`'s own loader already hold
+themselves to; `run_ground_truth` proven end to end against real git repos
+for all three reachable statuses (DONE, NOT_DONE, and UNVERIFIED via the
+budget-exceeded mechanism described above) plus both of the demo dataset's
+disagreement shapes, asserting the confusion matrix, the disagreement
+list, and that each disagreement's `detail` field actually points at real
+signal evidence rather than a generic message.
+
+## What's explicitly out of scope for Phase 20
+
+- **Fixing `VerdictStatus.UNVERIFIED`'s narrowed reachability.** Named and
+  proven, not patched — see above for why that's a separate, wider-blast-
+  radius change than this phase's own brief.
+- **No live-agent ground truth.** Every example uses `MockAdapter` with a
+  fixed patch, the same reproducibility trade-off `git_repo`-based tests
+  across this codebase already make — a real agent call would make the
+  dataset non-deterministic (a different diff on every run) and impossible
+  to keep a stable, reviewable "why this case disagrees" narrative for.
+  Nothing stops a team from building their own dataset from real, already-
+  completed agent attempts (a repo + a task + the actual diff that was
+  produced, hand-labeled once) using the exact same manifest format and
+  `run_ground_truth` call — `patch` just needs to be that diff's file
+  contents, not a hand-authored fixture.
+- **No persisted history of ground-truth runs across invocations**, no
+  `--compare-to` the way `flaky` has one — same scope line Phase 5/6/7
+  already drew for `bench`/`gate`/`calibrate` history; a `GroundTruthResult`
+  round-trips through `model_dump_json` like every other Pydantic type
+  here, so a team wanting a trend line can persist it themselves.
+- **No automatic CI gate on ground-truth accuracy** — same "diagnostic,
+  not a merge gate" policy `calibrate`/`flaky` already established, for
+  the same reason: `verdict gate` remains the only command whose exit code
+  blocks a merge, and it blocks on an executed PROVEN check, not a
+  statistical accuracy claim about the tool itself.
+- **Only four demo cases.** Deliberately small and adversarially chosen to
+  name real edges rather than pad an accuracy number, the same minimalism
+  `examples/calibration_dataset`'s four examples already established. A
+  team building real confidence in a production deployment should grow
+  this dataset from their own graded attempts, not treat four hand-built
+  cases as a statistically meaningful sample.
