@@ -12,6 +12,9 @@ defensively (`.get(...)`, type-checked, falls back to 0/None) — the same
 discipline `ClaudeCodeAdapter` already applies, for the same reason: a
 missing or renamed field should degrade the accounting, never crash the
 adapter.
+
+Phase 18: a 429/5xx is retried with backoff (`adapters/backoff.py`)
+before this adapter gives up — see that module's docstring for why.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ import json
 from pathlib import Path
 
 from verdict.adapters import AdapterError
+from verdict.adapters.backoff import call_with_backoff, exec_result_is_transient
 from verdict.sandbox import Sandbox
 from verdict.sandbox.config import fallback_sandbox
 from verdict.schema import AttemptResult
@@ -50,8 +54,10 @@ class CursorAdapter:
             "json",
             "-f",  # force: auto-accept edits, no interactive permission prompts
         ]
-        result = (sandbox or fallback_sandbox()).exec(
-            command, cwd=worktree, timeout_seconds=self._timeout_seconds
+        exec_sandbox = sandbox or fallback_sandbox()
+        result = call_with_backoff(
+            lambda: exec_sandbox.exec(command, cwd=worktree, timeout_seconds=self._timeout_seconds),
+            is_transient=exec_result_is_transient,
         )
         if result.exit_code == 127:
             raise CursorAdapterError(

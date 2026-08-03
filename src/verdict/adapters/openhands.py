@@ -20,6 +20,9 @@ someone establishes a real per-token figure some other way) still has
 something to look at. Guessing a number here would be strictly worse than
 reporting "unknown," per this whole schema's own discipline about
 `total_cost_usd`/`pass_rate_per_dollar` (see Phase 3's DESIGN.md section).
+
+Phase 18: a 429/5xx is retried with backoff (`adapters/backoff.py`)
+before this adapter gives up — see that module's docstring for why.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from verdict.adapters import AdapterError
+from verdict.adapters.backoff import call_with_backoff, exec_result_is_transient
 from verdict.sandbox import Sandbox
 from verdict.sandbox.config import fallback_sandbox
 from verdict.schema import AttemptResult
@@ -59,8 +63,10 @@ class OpenHandsAdapter:
             task,
             "--no-auto-continue",  # stop after the task is addressed, don't keep prompting itself
         ]
-        result = (sandbox or fallback_sandbox()).exec(
-            command, cwd=worktree, timeout_seconds=self._timeout_seconds
+        exec_sandbox = sandbox or fallback_sandbox()
+        result = call_with_backoff(
+            lambda: exec_sandbox.exec(command, cwd=worktree, timeout_seconds=self._timeout_seconds),
+            is_transient=exec_result_is_transient,
         )
         if result.exit_code == 127:
             raise OpenHandsAdapterError(

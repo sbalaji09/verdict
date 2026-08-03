@@ -5,6 +5,13 @@ binary a developer already has installed and authenticated, it's a stable
 process boundary (a crash or hang in the agent can't corrupt our process),
 and `--output-format json` hands back token/cost accounting for free —
 exactly what AttemptResult needs.
+
+Phase 18: a 429/5xx from Anthropic's own backend — surfaced by the CLI as
+a nonzero exit and an error message on stdout/stderr, since there's no
+raw HTTP response for Verdict to inspect directly — is retried with
+backoff (`adapters/backoff.py`) before this adapter gives up and raises
+`ClaudeCodeAdapterError`. See that module's docstring for why this lives
+here instead of Phase 11's generic infra-retry loop.
 """
 
 from __future__ import annotations
@@ -13,6 +20,7 @@ import json
 from pathlib import Path
 
 from verdict.adapters import AdapterError
+from verdict.adapters.backoff import call_with_backoff, exec_result_is_transient
 from verdict.sandbox import Sandbox
 from verdict.sandbox.config import fallback_sandbox
 from verdict.schema import AttemptResult
@@ -46,8 +54,10 @@ class ClaudeCodeAdapter:
             "--permission-mode",
             "acceptEdits",
         ]
-        result = (sandbox or fallback_sandbox()).exec(
-            command, cwd=worktree, timeout_seconds=self._timeout_seconds
+        exec_sandbox = sandbox or fallback_sandbox()
+        result = call_with_backoff(
+            lambda: exec_sandbox.exec(command, cwd=worktree, timeout_seconds=self._timeout_seconds),
+            is_transient=exec_result_is_transient,
         )
         if result.exit_code == 127:
             raise ClaudeCodeAdapterError(

@@ -22,6 +22,9 @@ both handled without needing a different `Adapter` shape:
 Like `CursorAdapter`, this mirrors `codex`'s publicly documented CLI
 surface as of writing; flags and event shapes can drift between CLI
 versions, hence the defensive, line-by-line, `.get()`-based parsing below.
+
+Phase 18: a 429/5xx is retried with backoff (`adapters/backoff.py`)
+before this adapter gives up — see that module's docstring for why.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ import json
 from pathlib import Path
 
 from verdict.adapters import AdapterError
+from verdict.adapters.backoff import call_with_backoff, exec_result_is_transient
 from verdict.sandbox import Sandbox
 from verdict.sandbox.config import fallback_sandbox
 from verdict.schema import AttemptResult
@@ -60,8 +64,10 @@ class CodexAdapter:
             "--json",
             "--skip-git-repo-check",  # the worktree is a throwaway branch, not necessarily "trusted"
         ]
-        result = (sandbox or fallback_sandbox()).exec(
-            command, cwd=worktree, timeout_seconds=self._timeout_seconds
+        exec_sandbox = sandbox or fallback_sandbox()
+        result = call_with_backoff(
+            lambda: exec_sandbox.exec(command, cwd=worktree, timeout_seconds=self._timeout_seconds),
+            is_transient=exec_result_is_transient,
         )
         if result.exit_code == 127:
             raise CodexAdapterError(
