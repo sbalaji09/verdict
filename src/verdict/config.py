@@ -1,10 +1,10 @@
 """Loads `verdict.yml` overrides from the repo being graded.
 
 `gates` (Phase 1), `cost` (Phase 3), `frontend` (Phase 4), `services`
-(Phase 10), and `backend` (Phase 14) are read. The `report` section from
-the README's example config belongs to a later phase and is still ignored
-rather than rejected, so a forward-looking config file doesn't break
-earlier phases.
+(Phase 10), `backend` (Phase 14), and `packages` (Phase 19) are read. The
+`report` section from the README's example config belongs to a later
+phase and is still ignored rather than rejected, so a forward-looking
+config file doesn't break earlier phases.
 """
 
 from __future__ import annotations
@@ -178,6 +178,25 @@ class ServiceSpec:
     6379 for redis, ...) — see `sandbox/services.py`'s allowlist."""
 
 
+@dataclass
+class PackageConfig:
+    """One entry under root `verdict.yml`'s `packages:` map, keyed by the
+    package's own path relative to the repo root (e.g. `"services/api"`)
+    — the path IS the package identifier, so `--package services/api`
+    both selects this entry and is the directory gates run against; no
+    separate name-to-path indirection to keep straight. Every field is a
+    *layer on top of* the root config's own (see `config_for_package`),
+    not a replacement — a monorepo-wide `gates.test` override in the root
+    `verdict.yml` still applies to a package that doesn't override `test`
+    itself.
+    """
+
+    gate_overrides: dict[str, str] = field(default_factory=dict)
+    token_pricing: TokenPricing | None = None
+    frontend: FrontendConfig | None = None
+    backend: BackendConfig | None = None
+
+
 class VerdictConfig:
     def __init__(
         self,
@@ -186,15 +205,48 @@ class VerdictConfig:
         frontend: FrontendConfig | None = None,
         services: list[ServiceSpec] | None = None,
         backend: BackendConfig | None = None,
+        packages: dict[str, PackageConfig] | None = None,
     ) -> None:
         self.gate_overrides = gate_overrides
         self.token_pricing = token_pricing
         self.frontend = frontend
         self.services = services or []
         self.backend = backend
+        self.packages = packages or {}
 
     def override_for(self, gate: str) -> str | None:
         return self.gate_overrides.get(gate)
+
+
+def config_for_package(config: VerdictConfig, package: str | None) -> VerdictConfig:
+    """Narrows a root `VerdictConfig` to one package's effective config —
+    the package's own overrides (from its `packages:` entry and/or its own
+    per-directory `verdict.yml`, already merged into `PackageConfig` by
+    `_parse_packages`) layered on top of the root's, so a monorepo-wide
+    default still applies to a package that doesn't override it itself.
+
+    `package is None` (the single-project-repo case, unchanged since
+    Phase 1) returns `config` as-is — this function is a no-op for every
+    repo that isn't declaring `packages:` at all. `package` naming a path
+    with no matching `packages:` entry (e.g. an ad hoc `--package` on a
+    repo with no `packages:` block) also returns `config` unchanged: gates
+    still autodetect against that package's own directory (the caller is
+    responsible for pointing gate resolution *at* that directory — see
+    `runner.py`), just with no package-specific overrides to layer in.
+    """
+    if package is None:
+        return config
+    pkg = config.packages.get(package)
+    if pkg is None:
+        return config
+    return VerdictConfig(
+        gate_overrides={**config.gate_overrides, **pkg.gate_overrides},
+        token_pricing=pkg.token_pricing or config.token_pricing,
+        frontend=pkg.frontend or config.frontend,
+        backend=pkg.backend or config.backend,
+        services=config.services,
+        packages=config.packages,
+    )
 
 
 def _parse_token_pricing(data: dict[str, object]) -> TokenPricing | None:
@@ -362,22 +414,55 @@ def _parse_services(raw: object) -> list[ServiceSpec]:
     return services
 
 
-def load_config(worktree: Path) -> VerdictConfig:
-    path = worktree / "verdict.yml"
+def _read_yaml(path: Path) -> dict[str, object]:
     if not path.exists():
-        return VerdictConfig(gate_overrides={})
-
+        return {}
     data = yaml.safe_load(path.read_text()) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _gate_overrides(data: dict[str, object]) -> dict[str, str]:
     gates = data.get("gates", {}) or {}
-    overrides = {
-        name: str(command)
-        for name, command in gates.items()
-        if name in GATE_NAMES and command
-    }
+    if not isinstance(gates, dict):
+        return {}
+    return {name: str(command) for name, command in gates.items() if name in GATE_NAMES and command}
+
+
+def _parse_packages(data: dict[str, object], worktree: Path) -> dict[str, PackageConfig]:
+    """Each `packages:` entry is keyed by its own path (relative to
+    `worktree`). Two sources of config are merged per package, package's
+    own `verdict.yml` (per-*directory* config — Phase 19's other half:
+    a package can be configured by dropping a `verdict.yml` right next to
+    it, exactly like the root always could) providing the base, and the
+    inline block under the root's `packages:` entry overriding it field by
+    field — so a root author can override one package's `gates.build`
+    without needing write access to (or even the existence of) that
+    package's own `verdict.yml`.
+    """
+    raw = data.get("packages")
+    if not isinstance(raw, dict):
+        return {}
+
+    packages: dict[str, PackageConfig] = {}
+    for path_str, entry in raw.items():
+        inline = entry if isinstance(entry, dict) else {}
+        directory = _read_yaml(worktree / str(path_str) / "verdict.yml")
+        packages[str(path_str)] = PackageConfig(
+            gate_overrides={**_gate_overrides(directory), **_gate_overrides(inline)},
+            token_pricing=_parse_token_pricing(inline) or _parse_token_pricing(directory),
+            frontend=_parse_frontend_config(inline) or _parse_frontend_config(directory),
+            backend=_parse_backend_config(inline) or _parse_backend_config(directory),
+        )
+    return packages
+
+
+def load_config(worktree: Path) -> VerdictConfig:
+    data = _read_yaml(worktree / "verdict.yml")
     return VerdictConfig(
-        gate_overrides=overrides,
+        gate_overrides=_gate_overrides(data),
         token_pricing=_parse_token_pricing(data),
         frontend=_parse_frontend_config(data),
         services=_parse_services(data.get("services")),
         backend=_parse_backend_config(data),
+        packages=_parse_packages(data, worktree),
     )

@@ -12,10 +12,11 @@ from verdict.acceptance import NONE_ACCEPTANCE, AcceptanceSpec, check_acceptance
 from verdict.adapters import Adapter, AdapterError
 from verdict.attribution.engine import attribute_failures
 from verdict.backend.runner import run_backend_checks
-from verdict.config import VerdictConfig, load_config
+from verdict.config import VerdictConfig, config_for_package, load_config
 from verdict.frontend.runner import run_frontend_checks
 from verdict.gates.registry import run_all_gates
 from verdict.integrity import DENY_ALL, TestChangeAllowance, check_test_integrity
+from verdict.monorepo import PackageSelectionError, resolve_package
 from verdict.sandbox import Sandbox, SandboxConfig, create_sandbox
 from verdict.sandbox.base import SandboxError
 from verdict.sandbox.install import run_setup_step
@@ -45,11 +46,14 @@ retrying it can never be "unfair" to the agent — no attempt was actually
 graded. See `_EVALUATION_ERRORS` below for exactly what triggers it.
 """
 
-_EVALUATION_ERRORS: tuple[type[Exception], ...] = (SandboxError, AdapterError, WorktreeError)
+_EVALUATION_ERRORS: tuple[type[Exception], ...] = (
+    SandboxError, AdapterError, WorktreeError, PackageSelectionError,
+)
 """Every exception that means "this attempt could not be evaluated at
 all" — sandbox provisioning failed, a declared service never became
 healthy, the install step hung, the adapter's own CLI crashed, worktree
-isolation itself failed. None of these are a legitimate agent NOT_DONE:
+isolation itself failed, or (Phase 19) which package to grade couldn't be
+resolved without guessing. None of these are a legitimate agent NOT_DONE:
 a NOT_DONE is always a *returned* `Verdict` with a real PROVEN FAIL signal
 in it, never a raised exception — `Adapter.run`'s docstring makes this
 the adapter's contract too ("must not raise on the agent merely failing
@@ -58,6 +62,13 @@ build an ERROR `Verdict` and retry; nowhere else in this module treats a
 returned NOT_DONE `Verdict` as something to retry automatically — that
 loop (`run_with_retries`'s `max_attempts`) is a structurally different
 piece of code below, opt-in and per the caller's own retry budget.
+
+A `PackageSelectionError` retrying via `max_error_retries` is genuinely
+pointless (the same ambiguous repo shape will raise it again every time),
+but it's still the right bucket: this is unambiguously "not the agent's
+fault" and must never be reported as a NOT_DONE, which is the property
+that actually matters — the wasted retries are a minor, bounded cost
+(`DEFAULT_MAX_ERROR_RETRIES`), not a correctness issue.
 """
 
 
@@ -97,6 +108,7 @@ def run(
     sandbox_config: SandboxConfig | None = None,
     allow_test_changes: TestChangeAllowance | None = None,
     acceptance: AcceptanceSpec | None = None,
+    package: str | None = None,
 ) -> Verdict:
     """Run `adapter` on `task` inside a throwaway worktree of `repo`, grade
     the result against every applicable gate (test/typecheck/build/lint),
@@ -134,6 +146,16 @@ def run(
     `suite/runner.py` constructs a non-empty one today (from a
     `SuiteTask`'s own `task.yml`/`tests.patch`), since a bare `verdict run`
     has no task directory to source a patch from.
+
+    `package` (Phase 19) is which package, if any, this task targets in a
+    monorepo — a path relative to `repo`, e.g. `"services/api"`. `None`
+    (the default) is exactly the pre-Phase-19 behavior for every repo this
+    doesn't apply to: gates resolve and run against the worktree root.
+    Resolution never guesses at an ambiguous repo shape — see
+    `monorepo.resolve_package` — and a `PackageSelectionError` propagates
+    out of this function to be caught by `_run_attempt` below as an
+    evaluation error, exactly like a sandbox that never came up: a config
+    problem, never a NOT_DONE blamed on the agent.
     """
     sandbox_config = sandbox_config or SandboxConfig()
     allowance = allow_test_changes or DENY_ALL
@@ -151,6 +173,8 @@ def run(
         # unchanged from before this phase — only the services list is
         # read this early.
         early_config = load_config(worktree.path)
+        resolved_package = resolve_package(worktree.path, early_config, package)
+        gate_root = worktree.path / resolved_package if resolved_package else worktree.path
         service_session = setup_services(early_config.services, sandbox_config.health_timeout_seconds)
 
         try:
@@ -169,12 +193,12 @@ def run(
                 # changed. `attempt_commit` is what attribution treats as "final".
                 attempt_commit = commit_all(worktree.path, "verdict: attempt final state")
 
-                config = load_config(worktree.path)
+                config = config_for_package(load_config(worktree.path), resolved_package)
                 attempt = _apply_pricing_fallback(attempt, config)
 
                 signals, attributions, budget_exceeded = _run_gates_and_attribution(
                     repo,
-                    worktree.path,
+                    gate_root,
                     worktree,
                     attempt_commit,
                     config,
@@ -288,6 +312,7 @@ def grade_existing_diff(
     base_ref: str,
     sandbox_config: SandboxConfig | None = None,
     allow_test_changes: TestChangeAllowance | None = None,
+    package: str | None = None,
 ) -> Verdict:
     """Grade `repo` exactly as it's already checked out against `base_ref`
     — no adapter, no worktree isolation. This is Phase 6's merge-gate entry
@@ -310,6 +335,10 @@ def grade_existing_diff(
     before Phase 10). Declared `services:` still start and health-gate
     first, though — a CI checkout with a real test suite needing Postgres
     is a common, real case this command should support too.
+
+    `package` (Phase 19) selects which package in a monorepo this PR/diff
+    is graded against, same meaning and same resolution rules as `run()`'s
+    own `package` parameter — see its docstring and `monorepo.py`.
     """
     repo = repo.resolve()
     base_commit = rev_parse(repo, base_ref)
@@ -331,13 +360,16 @@ def grade_existing_diff(
     allowance = allow_test_changes or DENY_ALL
     deadline = _budget_deadline(sandbox_config)
 
-    config = load_config(repo)
+    early_config = load_config(repo)
+    resolved_package = resolve_package(repo, early_config, package)
+    gate_root = repo / resolved_package if resolved_package else repo
+    config = config_for_package(early_config, resolved_package)
     service_session = setup_services(config.services, sandbox_config.health_timeout_seconds)
     try:
         gate_sandbox_config = _sandbox_config_for_services(sandbox_config, service_session)
         with create_sandbox(repo, gate_sandbox_config) as sandbox:
             signals, attributions, budget_exceeded = _run_gates_and_attribution(
-                repo, repo, worktree, final_commit, config, sandbox, sandbox_config, deadline
+                repo, gate_root, worktree, final_commit, config, sandbox, sandbox_config, deadline
             )
             if budget_exceeded or _budget_exceeded(deadline):
                 budget_exceeded = True
@@ -459,6 +491,7 @@ def _run_attempt(
     max_error_retries: int,
     allow_test_changes: TestChangeAllowance | None,
     acceptance: AcceptanceSpec | None,
+    package: str | None = None,
 ) -> list[Verdict]:
     """One logical attempt at `task`, with bounded automatic retry ONLY
     for `_EVALUATION_ERRORS` — infra that raised instead of returning a
@@ -484,6 +517,7 @@ def _run_attempt(
                     sandbox_config=sandbox_config,
                     allow_test_changes=allow_test_changes,
                     acceptance=acceptance,
+                    package=package,
                 )
             )
             return verdicts
@@ -502,6 +536,7 @@ def run_with_retries(
     allow_test_changes: TestChangeAllowance | None = None,
     acceptance: AcceptanceSpec | None = None,
     cost_ceiling_usd: float | None = None,
+    package: str | None = None,
 ) -> TaskRun:
     """Attempt `task` up to `max_attempts` times, stopping early on the
     first DONE. Every attempt is kept — including failed, abandoned ones —
@@ -540,13 +575,17 @@ def run_with_retries(
     `_known_total_cost` returns `None`, never a guessed number, the moment
     any attempt's own cost is unknown, so an adapter like OpenHands/Codex
     (no cost reporting today) simply can't be bounded this way.
+
+    `package` (Phase 19) is passed straight through to every `run()` call
+    this makes — see `run()`'s own docstring.
     """
     attempts: list[Verdict] = []
     max_iterations = max(max_attempts, 1)
     for i in range(max_iterations):
         attempts.extend(
             _run_attempt(
-                task, repo, adapter, sandbox_config, max_error_retries, allow_test_changes, acceptance
+                task, repo, adapter, sandbox_config, max_error_retries, allow_test_changes, acceptance,
+                package,
             )
         )
         latest = attempts[-1]
