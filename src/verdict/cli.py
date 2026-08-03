@@ -34,6 +34,12 @@ from verdict.flakiness import (
 )
 from verdict.frontend.vision_judge import MockVisionJudge, RealVisionJudge, VisionJudge
 from verdict.frontend.vision_transport import AnthropicVisionTransport
+from verdict.ground_truth import (
+    DEFAULT_ACCURACY_THRESHOLD,
+    load_ground_truth_dataset,
+    render_ground_truth,
+    run_ground_truth,
+)
 from verdict.integrity import TestChangeAllowance
 from verdict.monorepo import PackageSelectionError
 from verdict.pr_comment import build_comment_from_file
@@ -816,6 +822,68 @@ def calibrate_cmd(
 
     result = run_calibration(_build_judge(judge), examples, threshold=threshold)
     render_calibration(result)
+
+
+@app.command(name="ground-truth")
+def ground_truth_cmd(
+    dataset: Path = typer.Option(
+        ...,
+        "--dataset",
+        help="Path to a ground-truth manifest.json (see examples/ground_truth_dataset).",
+    ),
+    threshold: float = typer.Option(
+        DEFAULT_ACCURACY_THRESHOLD,
+        "--threshold",
+        help="Target accuracy against the human labels (fraction, e.g. 0.8).",
+    ),
+    sandbox_backend: str = typer.Option("docker", "--sandbox-backend", help=_SANDBOX_BACKEND_HELP),
+    sandbox_image: str = typer.Option(
+        "verdict-sandbox:0.1.0", "--sandbox-image", help="Image DockerSandbox runs."
+    ),
+    sandbox_cpus: float = typer.Option(2.0, "--sandbox-cpus", help="CPU limit passed to DockerSandbox."),
+    sandbox_memory_mb: int = typer.Option(
+        2048, "--sandbox-memory-mb", help="Memory limit (MB) passed to DockerSandbox."
+    ),
+    gate_timeout_seconds: int = typer.Option(
+        600, "--gate-timeout-seconds", help="Per-gate wall-clock timeout. A hang here is a real PROVEN FAIL."
+    ),
+    provision_timeout_seconds: int = typer.Option(
+        120, "--provision-timeout-seconds", help="How long DockerSandbox waits for `docker run` to come up."
+    ),
+    install_timeout_seconds: int = typer.Option(
+        300, "--install-timeout-seconds", help="Timeout for the dependency-install step."
+    ),
+    attempt_budget_seconds: int = typer.Option(
+        1800,
+        "--attempt-budget-seconds",
+        help="Global wall-clock ceiling across one whole attempt. 0 disables it.",
+    ),
+    health_timeout_seconds: int = typer.Option(
+        30, "--health-timeout-seconds", help="How long a declared service gets to pass its health check."
+    ),
+) -> None:
+    """Replay every (repo, task, patch) in `--dataset` through the real
+    `verdict run` pipeline and compare Verdict's own DONE/NOT_DONE/
+    UNVERIFIED status to each example's human-assigned label — precision/
+    recall/F1 per label, a full confusion matrix, and every individual
+    disagreement, so a claim about how trustworthy Verdict is can be
+    checked rather than taken on faith. Never fails the process, the same
+    diagnostic-not-gate policy `calibrate` already uses: a below-threshold
+    accuracy prints a warning, not a nonzero exit.
+    """
+    sandbox_config = _build_sandbox_config(
+        sandbox_backend, sandbox_image, sandbox_cpus, sandbox_memory_mb,
+        gate_timeout_seconds, provision_timeout_seconds, install_timeout_seconds, attempt_budget_seconds,
+        health_timeout_seconds,
+    )
+    try:
+        examples = load_ground_truth_dataset(dataset)
+    except DatasetLoadError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    result = run_ground_truth(examples, sandbox_config=sandbox_config, threshold=threshold)
+    render_ground_truth(result)
 
 
 @app.command(name="flaky")
