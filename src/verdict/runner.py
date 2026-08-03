@@ -402,6 +402,55 @@ def _error_verdict(task: str, agent: str, repo: Path, exc: Exception) -> Verdict
     )
 
 
+def _known_total_cost(verdicts: list[Verdict]) -> float | None:
+    """Mirrors `TaskRun.total_cost_usd`'s own "any unknown attempt cost
+    poisons the whole sum" rule (`schema.py`) — computed here, over a
+    plain list, because `run_with_retries`'s cost-ceiling check (below)
+    needs the running total mid-loop, before a `TaskRun` exists to ask.
+    `None` (never a partial figure) the moment any attempt's own cost is
+    unknown — an adapter that never reports cost (OpenHands, Codex today)
+    simply can't be bounded by a dollar ceiling, honestly: there is
+    nothing to compare against, not a guessed zero.
+    """
+    total = 0.0
+    for v in verdicts:
+        if v.attempt.cost_usd is None:
+            return None
+        total += v.attempt.cost_usd
+    return total
+
+
+def _cost_ceiling_abort_verdict(task: str, agent: str, repo: Path, ceiling: float, spent: float) -> Verdict:
+    """Phase 18: appended as the LAST attempt when `run_with_retries`
+    chooses not to start another agent attempt because this task's own
+    running spend already met `cost_ceiling_usd` — even though
+    `max_attempts` retries were still available. Every attempt that
+    actually ran stays exactly as it is in `TaskRun.attempts`, real
+    signals and real cost included ("partial results preserved and
+    marked, not lost"); this is an ADDITIONAL marker, never a replacement
+    for what already happened.
+
+    Reuses `VerdictStatus.ERROR` for the same reason Phase 15's suite-
+    level cost ceiling does (`suite/runner.py::_skipped_task_run`): ERROR
+    already means "not evaluated as a normal attempt, for a reason that
+    isn't the agent's fault," and `ConfigResult.pass_rate`/`tasks_errored`
+    already exclude it from both sides of the ratio (Phase 10/11) — no
+    new accounting rule needed, a cost-ceiling abort is not an agent
+    failure and this makes that true by construction, not by convention.
+    """
+    return Verdict(
+        task=task,
+        agent=agent,
+        repo=str(repo),
+        attempt=AttemptResult(diff="", files_changed=[], cost_usd=0.0),
+        signals=[],
+        error=(
+            f"aborted: per-run cost ceiling (${ceiling:.2f}) reached after ${spent:.2f} spent — "
+            "see the prior attempt(s) in this TaskRun for the real, already-graded results"
+        ),
+    )
+
+
 def _run_attempt(
     task: str,
     repo: Path,
@@ -452,6 +501,7 @@ def run_with_retries(
     max_error_retries: int = DEFAULT_MAX_ERROR_RETRIES,
     allow_test_changes: TestChangeAllowance | None = None,
     acceptance: AcceptanceSpec | None = None,
+    cost_ceiling_usd: float | None = None,
 ) -> TaskRun:
     """Attempt `task` up to `max_attempts` times, stopping early on the
     first DONE. Every attempt is kept — including failed, abandoned ones —
@@ -471,9 +521,29 @@ def run_with_retries(
     the attempt, handing the same broken sandbox back to the agent for
     another `max_attempts` round won't fix it — it would just spend more
     of the agent's budget for no evaluative benefit.
+
+    `cost_ceiling_usd` (Phase 18) is a hard, per-run spend cap: after each
+    attempt, if the known total cost across every attempt so far already
+    meets it AND another attempt would otherwise have started, no further
+    attempt runs — a synthetic ERROR `Verdict` (`_cost_ceiling_abort_
+    verdict`) is appended instead, marking the abort as infra policy, not
+    an agent failure, so `ConfigResult.pass_rate` excludes this task the
+    same way it already excludes any other ERROR (Phase 10/11). Every
+    attempt that DID run before the ceiling was reached stays in
+    `TaskRun.attempts` untouched — nothing is discarded, only the attempts
+    that would have come next are skipped. `None` (the default) disables
+    this entirely, matching every other cost-ceiling knob in this codebase
+    (`SandboxConfig.attempt_budget_seconds`, Phase 15's suite-level
+    `cost_ceiling_usd`) in treating "no ceiling" as the safe, explicit
+    default. A ceiling can only ever fire for an adapter that actually
+    reports cost (directly, or via `verdict.yml`'s pricing fallback) —
+    `_known_total_cost` returns `None`, never a guessed number, the moment
+    any attempt's own cost is unknown, so an adapter like OpenHands/Codex
+    (no cost reporting today) simply can't be bounded this way.
     """
     attempts: list[Verdict] = []
-    for _ in range(max(max_attempts, 1)):
+    max_iterations = max(max_attempts, 1)
+    for i in range(max_iterations):
         attempts.extend(
             _run_attempt(
                 task, repo, adapter, sandbox_config, max_error_retries, allow_test_changes, acceptance
@@ -482,4 +552,11 @@ def run_with_retries(
         latest = attempts[-1]
         if latest.done or latest.status is VerdictStatus.ERROR:
             break
+        if cost_ceiling_usd is not None and i < max_iterations - 1:
+            total_cost = _known_total_cost(attempts)
+            if total_cost is not None and total_cost >= cost_ceiling_usd:
+                attempts.append(
+                    _cost_ceiling_abort_verdict(task, adapter.name, repo, cost_ceiling_usd, total_cost)
+                )
+                break
     return TaskRun(task=task, agent=adapter.name, repo=str(repo), attempts=attempts)

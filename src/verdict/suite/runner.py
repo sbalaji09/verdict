@@ -76,6 +76,7 @@ def _run_task(
     max_attempts: int,
     sandbox_config: SandboxConfig | None,
     max_error_retries: int,
+    run_cost_ceiling_usd: float | None = None,
 ) -> TaskRun:
     return run_with_retries(
         task=task.task,
@@ -93,6 +94,14 @@ def _run_task(
         # Phase 13: the task's own held-out FAIL_TO_PASS/PASS_TO_PASS
         # tests, if it declared any — see `acceptance.py`.
         acceptance=task.acceptance,
+        # Phase 18: a hard per-(config, task) spend cap — distinct from
+        # this module's own `cost_ceiling_usd` (a suite-WIDE cap, checked
+        # by `_run_task_within_ceiling` below before a task even starts).
+        # This one bounds one task's own agent-retry loop, threaded down
+        # to `run_with_retries` unchanged; see that function's docstring
+        # for exactly how it aborts and why the abort isn't an agent
+        # failure.
+        cost_ceiling_usd=run_cost_ceiling_usd,
     )
 
 
@@ -156,15 +165,16 @@ def _run_task_within_ceiling(
     sandbox_config: SandboxConfig | None,
     max_error_retries: int,
     ceiling: _CostCeiling | None,
+    run_cost_ceiling_usd: float | None = None,
 ) -> TaskRun:
     """The picklable unit of work handed to `Executor.run` — `_run_task`
-    itself plus the cost-ceiling check, kept as one function so a single
-    work item is one self-contained callable rather than the executor
-    needing to know about two separate steps per item.
+    itself plus the SUITE-wide cost-ceiling check, kept as one function so
+    a single work item is one self-contained callable rather than the
+    executor needing to know about two separate steps per item.
     """
     if ceiling is not None and ceiling.exceeded():
         return _skipped_task_run(task, config, ceiling)
-    task_run = _run_task(task, config, max_attempts, sandbox_config, max_error_retries)
+    task_run = _run_task(task, config, max_attempts, sandbox_config, max_error_retries, run_cost_ceiling_usd)
     if ceiling is not None and task_run.total_cost_usd is not None:
         ceiling.add(task_run.total_cost_usd)
     return task_run
@@ -178,6 +188,7 @@ def run_suite(
     max_error_retries: int = DEFAULT_MAX_ERROR_RETRIES,
     executor: Executor | None = None,
     cost_ceiling_usd: float | None = None,
+    run_cost_ceiling_usd: float | None = None,
 ) -> list[ConfigResult]:
     """Every config runs against every task, independently — one config's
     cost or failure has no bearing on another's, and one task's result
@@ -198,6 +209,15 @@ def run_suite(
     disables it, matching every other None-disables-the-cap knob in this
     codebase (`SandboxConfig.attempt_budget_seconds`, etc.).
 
+    `run_cost_ceiling_usd` (Phase 18) is a DIFFERENT, finer-grained cap:
+    passed straight through to every `run_with_retries` call as its own
+    `cost_ceiling_usd`, bounding one `(config, task)` pair's own agent-
+    retry spend rather than the whole suite's. The two compose freely —
+    a suite can bound both "never spend more than $X total" and "never
+    spend more than $Y retrying any single task" at once, since they're
+    checked at different layers (`_CostCeiling` here vs. `run_with_
+    retries`'s own loop) with no interaction between them.
+
     Work items are built in the same `(config, task)` nesting the
     original serial loop used and results are sliced back out by that
     same fixed position — never by completion order — so the returned
@@ -217,7 +237,7 @@ def run_suite(
 
     try:
         items = [
-            (task, config, max_attempts, sandbox_config, max_error_retries, ceiling)
+            (task, config, max_attempts, sandbox_config, max_error_retries, ceiling, run_cost_ceiling_usd)
             for config in configs
             for task in tasks
         ]
