@@ -171,9 +171,22 @@ frontend:
 
 cost:
   price_per_1k_tokens: { input: 0.003, output: 0.015 }
+
+# Monorepos only — see below
+packages:
+  services/api:
+    gates:
+      test: "pytest -q"
+  apps/web:
+    gates:
+      build: "npm run build"
 ```
 
 Report format is a CLI flag, not a `verdict.yml` key: `--report cli --report json --report html --output-dir verdict-report` (repeatable; any combination). `json`/`html` write `verdict-report.json`/`verdict-report.html` — the HTML file is a single, self-contained dashboard (inline CSS/JS, no external requests) suitable as a CI artifact.
+
+### Monorepos
+
+A repo with no project files at its root but multiple independent packages underneath (e.g. `services/api`, `apps/web`) is ambiguous — Verdict never guesses which one a task targets. Point it at one explicitly with `--package services/api` (on `verdict run` or `verdict gate`), or declare it in `verdict.yml`'s `packages:` block as above (a `packages:` block naming exactly one package is used automatically, no flag needed). A package's own `verdict.yml`, sitting in its own directory, is read too — root-level `gates:`/`frontend:`/`backend:` still act as monorepo-wide defaults a package inherits unless it overrides them itself. A custom build system (`make`, `bazel`, `gradle`, …) is just another `gates.build` override, at the root or per-package — same mechanism as any other gate override, nothing monorepo-specific about it.
 
 ## Benchmark suites
 
