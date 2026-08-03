@@ -4227,3 +4227,216 @@ set without the other.
 - **`gate_cmd` gaining a cost ceiling.** `verdict gate` grades an
   existing diff in place — no adapter is ever driven, so there's no
   agent spend for either ceiling to bound.
+
+---
+
+## Phase 19 — Surviving Real-World Repo Shapes
+
+## The problem, restated
+
+Every autodetector through Phase 18 assumes one thing implicitly: the repo
+root itself is the project. A `pytest.ini` at the top, a `package.json` at
+the top, a `tsconfig.json` at the top. That's true of every fixture this
+project has graded so far and false of a large share of real repositories
+— a monorepo with `services/api` and `apps/web` as two unrelated Python/
+JS projects sharing one `.git`, or a repo whose build is `make` / `bazel
+build //...` / `gradle build` rather than anything the four gates already
+know how to autodetect. Handed one of those, the pre-Phase-19 code doesn't
+fail loudly — it just reports every gate `NA`, which reads exactly like
+"this repo genuinely has no test suite," a silent misdetection wearing an
+honest-looking status. Phase 19's brief is explicit about the fix: never
+guess, degrade to asking for config.
+
+## Two axes, one underlying discipline
+
+"Per-directory / per-package config," "monorepo package selection," and
+"manual overrides for every gate" all reduce to the same two questions,
+answered by two small, separable pieces:
+
+1. **Which directory are gates even resolved and run against?** —
+   `monorepo.py`'s `resolve_package`.
+2. **What config applies once that directory is picked?** —
+   `config.py`'s `packages:` parsing plus `config_for_package`.
+
+Custom build systems (`make`, `bazel`, `gradle`) need no *new* mechanism
+at all: `gates.build: "make build"` (or `"bazel build //..."`, or
+`"gradle build"`) already runs verbatim through the exact override path
+Phase 1 built for `next build` — see `gates/build.py`'s own module
+docstring on why there's no cross-project build schema to autodetect
+against. What Phase 19 adds is the ability to say that *per package*, not
+just once for the whole repo (below), and a fixture
+(`test_custom_build_system_gate_runs_via_explicit_override`) that proves
+it against a real `Makefile`, closing the literal "make/bazel/gradle via
+explicit verdict.yml config" ask.
+
+## Package identity IS its path — no separate name
+
+```yaml
+# verdict.yml, at the repo root
+packages:
+  services/api:
+    gates:
+      test: "pytest -q"
+  apps/web:
+    gates:
+      build: "npm run build"
+```
+
+A `packages:` entry is keyed by the package's own path, relative to the
+repo root — not an arbitrary label mapped to a `path:` field. `--package
+services/api` both selects this entry *and* is the literal directory every
+gate resolves and executes against. This was a deliberate simplification
+over an earlier name→path design considered before writing code: a name
+indirection would need its own collision/uniqueness rules and buys
+nothing a path doesn't already give for free — the path is already the
+one thing that's guaranteed unique and is exactly what a human would type
+to `cd` there themselves.
+
+## Config layering: root defaults, package overrides, per-directory files — three sources, one precedence order
+
+`PackageConfig` (`config.py`) holds one package's own `gate_overrides`/
+`token_pricing`/`frontend`/`backend` — the same fields `VerdictConfig`
+itself has, at package scope. `config_for_package(config, package)`
+layers a package's config *on top of* the root's, field by field, rather
+than replacing it wholesale:
+
+```python
+VerdictConfig(
+    gate_overrides={**config.gate_overrides, **pkg.gate_overrides},
+    token_pricing=pkg.token_pricing or config.token_pricing,
+    frontend=pkg.frontend or config.frontend,
+    backend=pkg.backend or config.backend,
+    ...
+)
+```
+
+So a monorepo-wide `gates.lint` override at the root still applies to
+`services/api` even though that package only overrides `test` itself —
+"per-package config" was never meant to mean "every package repeats every
+shared setting."
+
+Each package's `gate_overrides` are themselves merged from **two**
+sources before that layering even happens, in `_parse_packages`:
+
+1. The package's **own `verdict.yml`**, sitting directly in its directory
+   (`services/api/verdict.yml`) — genuine **per-directory config**, read
+   with the exact same `_read_yaml`/`_gate_overrides` helpers the root
+   file already uses. A package can be configured by a contributor who
+   only has write access to (or even only knows about) that one
+   subdirectory, without touching the root file at all.
+2. The **inline block** under the root's `packages:` entry for that path.
+
+Inline wins over the directory file field-by-field
+(`{**directory, **inline}`) — a root author reviewing/curating every
+package's config from one place can always override what a package's own
+file says, the same "the more central, more reviewed source wins" logic
+`_apply_pricing_fallback` already uses for adapter-reported vs.
+`verdict.yml`-configured cost.
+
+## Resolution: explicit beats declared-unambiguous beats "don't guess"
+
+`resolve_package(worktree, config, requested)` (`monorepo.py`) returns
+either a relative path or `None` — `None` meaning "grade the worktree
+root," the exact, unchanged, zero-risk default every single-project
+fixture from Phase 0 onward already exercises. It only ever returns
+something else, or raises, by an explicit or genuinely unambiguous
+signal:
+
+1. `requested` (`--package`) always wins outright when given, checked
+   only for existing as a real directory.
+2. Exactly one declared `packages:` entry is itself an unambiguous,
+   author-written answer — used without a flag.
+3. Two or more declared entries and no `--package` → `PackageSelectionError`
+   naming them, never a silent pick of "the first one."
+4. No `packages:` block at all: if the worktree root itself carries a
+   `PROJECT_MARKERS` file (`pyproject.toml`, `package.json`, `Makefile`,
+   `go.mod`, `Cargo.toml`, `build.gradle`, a Bazel `WORKSPACE`, …), it's a
+   normal single-project repo → `None`, identical to every phase before
+   this one.
+5. No block, no root markers, and `detect_sibling_candidates` (scanning up
+   to two directory levels — deep enough to catch both `api/` directly
+   under the root and the `services/api` / `apps/web` grouping-folder
+   shape Turborepo/Nx-style monorepos use, shallow enough to stop at the
+   first directory that itself has markers rather than wandering into its
+   internals) finds **two or more** independently-markered directories →
+   `PackageSelectionError`, this phase's core "ask, don't guess" case.
+6. Same as 5 but **at most one** candidate → still `None`. A single
+   nested project isn't a choice between alternatives — there's nothing
+   to disambiguate, so gates resolve against the worktree root exactly as
+   they did in every earlier phase (correctly reporting `NA`, the same
+   honest "nothing detected here" Phase 1 already established). This is a
+   deliberately conservative line: raising for a single candidate too
+   would be a real behavior change for any existing repo shaped this way,
+   trading a known-safe default for a guess about what the caller wanted.
+   `--package` remains available to point at that one nested project
+   explicitly.
+
+## Where `PackageSelectionError` lands: the existing ERROR bucket, not a new one
+
+`PackageSelectionError` joins `_EVALUATION_ERRORS` in `runner.py` — the
+exact tuple `SandboxError`/`AdapterError`/`WorktreeError` already use to
+mean "this attempt could not be evaluated at all." No new `VerdictStatus`,
+no new accounting rule: `ConfigResult.pass_rate`/`tasks_errored` already
+exclude `ERROR` from both sides of the ratio (Phase 10/11), so a run
+against an unconfigured monorepo shows up as "we couldn't tell," never as
+a fabricated agent failure. `gate_cmd` catches it the same way it already
+catches `WorktreeError` — printed, exit code 2. This is the same reuse
+Phase 18's cost-ceiling abort leaned on: the taxonomy for "not the agent's
+fault" already existed; Phase 19 just adds one more thing that belongs in
+it.
+
+## Threading `package` through `run()`/`grade_existing_diff()`
+
+Both entry points resolve their package once, early — right after loading
+each one's own early `VerdictConfig` — and pass the resulting directory as
+`gate_worktree_path` to the already-existing `_run_gates_and_attribution`
+helper, which has taken `gate_worktree_path` as a parameter separate from
+the attribution worktree since Phase 6 (`grade_existing_diff` needed that
+split for an unrelated reason — see its own section above). No new
+plumbing was needed there: a package is just a different `gate_worktree_
+path` value, and every one of the four `ToolRunner`s already takes
+whatever `Path` it's handed as its `applicable()`/`run()` cwd, with zero
+awareness that the caller picked it via package resolution rather than
+always being the worktree root.
+
+## What's explicitly out of scope for Phase 19
+
+- **Frontend/backend checks are not package-scoped.** `run_frontend_checks`/
+  `run_backend_checks` still receive the whole worktree root as their
+  `start` command's cwd, even when a package config supplies its own
+  `frontend:`/`backend:` section. A package-level frontend/backend `start`
+  command needs to `cd` into its own directory itself (e.g. `cd apps/web
+  && npm run dev`) — the same raw-shell-string contract `verdict.yml`
+  overrides already have everywhere else. Scoping the dev-server cwd
+  itself is a real gap, not fixed here: `run_frontend_checks` takes a
+  `Worktree` dataclass throughout (used for more than just a cwd — the
+  before/after diff, the dependency graph scan), and threading a second
+  "which subdirectory" concept through it is real surgery deferred to a
+  later phase, not something this one's fixtures needed to prove the
+  brief's actual ask (gates + build systems + config resolution).
+- **Attribution's bisection is not package-scoped.** `attribute_failures`/
+  `base_gate_signals`/`bisect_cli.py` still resolve gates against whatever
+  `worktree`/candidate-commit root they're handed, unaware of package
+  selection — a bisection re-run inside a monorepo package would need
+  `bisect_cli.py` (invoked fresh by `git bisect run` at each candidate
+  commit, with no channel today to pass it anything beyond `<gate>
+  [identity]`) to also know which package to scope to. Real future work,
+  called out rather than silently left inconsistent: a failing signal in
+  a graded package still gets a correct PROVEN result either way (that's
+  what this phase's fixtures assert), it just won't get a bisected
+  culprit-file sentence the way a single-project repo's failure would.
+- **`bench`/`flaky` don't expose `--package`.** Both iterate a whole suite
+  or many trials of one task against one repo; `run`/`gate` — where "one
+  task, one package" is the natural unit — got the flag first. Adding it
+  to the multi-task commands is straightforward (the same `resolve_package`
+  call, threaded one level further) but wasn't needed to satisfy this
+  phase's own acceptance fixtures.
+- **No package auto-discovery beyond two directory levels**, and no
+  "workspaces" field awareness (`package.json`'s own `workspaces:`, a Go
+  workspace `go.work`, Cargo's `[workspace] members`) — `PROJECT_MARKERS`
+  is deliberately a dumb, cross-ecosystem file-existence scan, not a
+  parser for every package manager's own workspace format. A monorepo
+  using one of those could still be graded correctly today by declaring
+  its packages explicitly in `verdict.yml`; teaching `monorepo.py` to read
+  a `package.json` workspaces glob is a plausible, separable follow-up,
+  not required by this phase's own brief.
