@@ -215,6 +215,16 @@ verdict flaky --task "fix the bug" --agent mock --repo examples/sample_repo --tr
 
 `calibrate` warns (never fails the process) when a judge's concordance with human labels drops below `--threshold` (default 95%). `flaky --compare-to` runs a real two-proportion z-test, not a raw percentage diff, so a ten-point pass-rate swing across a handful of trials gets called `NOISE` rather than a false-alarm `REGRESSION`.
 
+## Ground truth: is Verdict itself right?
+
+Every diagnostic above assumes `Verdict.status` is correct. `verdict ground-truth` checks that assumption directly: it replays a set of (repo, task, patch, human-assigned label) examples through the real pipeline and reports precision/recall/F1 per label, a full confusion matrix, and every individual case where Verdict and a human disagreed — see DESIGN.md's Phase 20 section for the full methodology and two real, named disagreements the demo dataset surfaces (a pre-existing unrelated failure Verdict is too strict about, and a gamed test Verdict is too lenient about).
+
+```bash
+verdict ground-truth --dataset examples/ground_truth_dataset/manifest.json --sandbox-backend local
+```
+
+Like `calibrate`, this never fails the process — a below-`--threshold` accuracy prints a warning, not a nonzero exit.
+
 ## Roadmap
 
 - [x] Executable grounding: test / typecheck / build / lint in isolated worktrees
@@ -226,6 +236,7 @@ verdict flaky --task "fix the bug" --agent mock --repo examples/sample_repo --tr
 - [x] Adapters: Claude Code, Cursor, Codex, Aider, OpenHands
 - [x] Judge calibration report (concordance vs. human labels, target ≥ 95%)
 - [x] Flakiness detection (multi-seed variance, confidence intervals on pass-rate)
+- [x] Ground-truth evaluation: precision/recall/F1/confusion matrix of Verdict's own status vs. human labels
 - [ ] Hosted dashboard + historical regression tracking
 
 ## How Verdict relates to prior work

@@ -15,3 +15,7 @@ examples/sample_frontend_repo/.git/
 examples/starter_suite/bug-fix/repo/.git/
 examples/starter_suite/refactor/repo/.git/
 examples/starter_suite/feature-add/repo/.git/
+examples/ground_truth_dataset/clean-fix/.git/
+examples/ground_truth_dataset/still-broken/.git/
+examples/ground_truth_dataset/preexisting-failure/.git/
+examples/ground_truth_dataset/hardcoded-test-gaming/.git/
