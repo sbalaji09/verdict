@@ -417,6 +417,16 @@ def run_cmd(
     health_timeout_seconds: int = typer.Option(
         30, "--health-timeout-seconds", help="How long a declared service gets to pass its health check."
     ),
+    cost_ceiling_usd: float = typer.Option(
+        0.0,
+        "--cost-ceiling-usd",
+        help=(
+            "Hard cap on spend across every --max-attempts retry of this one task. 0 disables it. "
+            "Reached mid-retry-loop → the loop stops cleanly, every attempt already made is kept, "
+            "and the abort is marked ERROR (excluded from pass-rate math), never a NOT_DONE agent "
+            "failure — see DESIGN.md's Phase 18 section."
+        ),
+    ),
 ) -> None:
     """Run an agent against one task (retrying on failure if --max-attempts > 1)
     and print its Verdict plus the cost across every attempt made.
@@ -439,6 +449,9 @@ def run_cmd(
         sandbox_config=sandbox_config,
         max_error_retries=max_error_retries,
         allow_test_changes=TestChangeAllowance(allowed=allow_test_changes),
+        # 0 means "no ceiling" at the CLI layer, same spelling every other
+        # None-disables-the-cap knob in this CLI already uses.
+        cost_ceiling_usd=cost_ceiling_usd if cost_ceiling_usd > 0 else None,
     )
 
     if "cli" in report:
@@ -527,6 +540,16 @@ def bench_cmd(
             "Cooperative, not preemptive — see DESIGN.md's Phase 15 section."
         ),
     ),
+    run_cost_ceiling_usd: float = typer.Option(
+        0.0,
+        "--run-cost-ceiling-usd",
+        help=(
+            "Hard cap on spend across --max-attempts retries of any ONE (config, task) pair — "
+            "distinct from --cost-ceiling-usd's suite-wide total. 0 disables it. An abort here is "
+            "marked ERROR (excluded from pass-rate math), never a NOT_DONE agent failure — see "
+            "DESIGN.md's Phase 18 section."
+        ),
+    ),
     store: Path | None = typer.Option(
         None,
         "--store",
@@ -583,6 +606,7 @@ def bench_cmd(
         # 0 means "no ceiling" at the CLI layer, same spelling
         # `--attempt-budget-seconds` already uses for its own None-disables knob.
         cost_ceiling_usd=cost_ceiling_usd if cost_ceiling_usd > 0 else None,
+        run_cost_ceiling_usd=run_cost_ceiling_usd if run_cost_ceiling_usd > 0 else None,
     )
 
     _run_id, history = _persist_run(
