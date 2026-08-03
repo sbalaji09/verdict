@@ -4015,3 +4015,215 @@ copying a path out and opening it by hand.
   whole suite of independently-versioned task repos, so there's no single
   "the" commit to auto-derive — `--commit-sha` stays a caller-supplied,
   free-form string there.
+
+## Phase 18 — Hardening the Adapter Layer
+
+## The problem, restated
+
+Every shipped `Adapter` (Phase 5) shells out to a real, paid, rate-
+limited coding-agent CLI — `claude`, `cursor-agent`, `codex`, `aider`,
+`openhands` — and until this phase, a single 429 or a transient 5xx from
+whatever provider that CLI wraps looked identical to every other adapter
+failure: an immediate `AdapterError`, falling into Phase 11's generic
+`max_error_retries` loop, which retries instantly with no backoff. That's
+the wrong response to a rate limit specifically — retrying instantly
+against a live 429 just trips it again — and it conflates two genuinely
+different failures ("the CLI binary isn't installed," permanent, and
+"the provider is briefly overloaded," transient) under one policy.
+Separately, nothing before this phase could stop a `--max-attempts`
+retry loop from spending arbitrarily more against one stubborn task, and
+`run_suite`'s Phase 15 cost ceiling only ever bounded a whole suite's
+total, never one task's own retry budget. Phase 18 closes both gaps —
+per-adapter backoff, and a hard per-run cost ceiling — without touching
+`Verdict`'s schema or `Adapter`'s Protocol.
+
+## Backoff: per-adapter, because only the adapter can tell
+
+`adapters/backoff.py` is the one new module, providing three pieces every
+adapter shares: `looks_transient(text)` (a generic regex scan for the
+handful of ways a CLI is likely to print a 429/5xx — a literal status
+code, "rate limit", "too many requests", "overloaded", "service
+unavailable", ...), `exec_result_is_transient(result)` (the actual
+predicate: never true for a timeout or exit code 127 — a hung process or
+a missing binary isn't a rate limit, retrying either would just waste
+`max_retries` cycles for nothing — otherwise a text scan of the combined
+stdout+stderr), and `call_with_backoff(attempt_fn, is_transient, ...)`
+(exponential backoff with full jitter, up to `max_retries` extra calls).
+
+Every one of the five adapters wires this in at its own `sandbox.exec()`
+call site — `result = call_with_backoff(lambda: exec_sandbox.exec(...),
+is_transient=exec_result_is_transient)` replacing the bare `.exec()` call
+— and nothing else in each adapter changes: the exit-127/timeout/nonzero-
+with-no-payload checks immediately below are unchanged, still reading
+whatever `call_with_backoff` finally returned. **Why per-adapter, not one
+blanket wrapper in `runner.py`:** only the adapter knows the shape of the
+command/output it's parsing (a JSON payload for Claude/Cursor, newline-
+delimited events for Codex, a scraped text summary for Aider, nothing at
+all for OpenHands) — `is_transient` has to look at that adapter's own
+`ExecResult`, which `runner.py` never sees (it only ever sees the
+`AttemptResult` an adapter's `run()` returns, or the `AdapterError` it
+raises). Keeping the retry inside the adapter also means it's invisible
+to `TaskRun.attempts`/`attempt_count`: from `runner.py`'s point of view,
+`adapter.run()` either takes a little longer than usual and succeeds, or
+still fails after using its own retry budget and raises `AdapterError`
+exactly as before — Phase 11's `max_error_retries` loop is completely
+unaware backoff happened underneath it, and needed no changes.
+
+**Full jitter, not a fixed exponential schedule.** `backoff_delay`
+multiplies the exponential term by a uniform `[0, 1)` draw
+(`jitter() * exp`), the standard fix for the thundering-herd failure mode
+a fixed schedule has: several clients backing off in lockstep would all
+retry at the exact same instant and re-trip the same rate limit together.
+
+**Precise usage accounting survives a retry for free, not by extra
+code.** A rejected 429 call never produced billable output for a CLI to
+report a `total_cost_usd`/usage figure from — `call_with_backoff` returns
+only the LAST result, and each adapter's existing usage-parsing code
+(already reading `usage`/`total_cost_usd` from exactly one payload) reads
+that one final result exactly as it always did. There is no accumulation
+across retried calls to get wrong, so "unknown cost stays `None`, never a
+partial sum" — the rule this phase's brief calls out explicitly — was
+never at risk; it just needed verifying, not new code (confirmed
+directly: `test_all_adapters_retry_a_transient_failure_and_then_succeed`
+proves a real `AttemptResult` comes back correctly after two injected
+429s, for all five adapters).
+
+## The per-run cost ceiling: a hard stop, not a suggestion
+
+`run_with_retries` (`runner.py`) gains `cost_ceiling_usd: float | None =
+None`. After each attempt, if the known total cost across every attempt
+made SO FAR already meets the ceiling — and another attempt would
+otherwise have started (there's `max_attempts` budget left, and the
+latest attempt wasn't already DONE or ERROR) — no further attempt runs.
+A synthetic `Verdict` (`_cost_ceiling_abort_verdict`) is appended as the
+final attempt instead, and the loop stops.
+
+**"Hard" within the limits of what Verdict can actually see.** Verdict
+has no visibility into an agent's spend WHILE its CLI is running — it
+only learns the cost after the process exits and reports its own
+`total_cost_usd`/usage figures. So a ceiling can only ever be enforced at
+attempt BOUNDARIES: an attempt already in flight always finishes: this is
+the identical "cooperative, not preemptive" honesty Phase 15's suite-wide
+ceiling already documents for the same underlying reason. What makes THIS
+ceiling hard rather than merely advisory is that it always fires — no
+race, no in-flight competing work the way a parallel suite has — the
+very next attempt in `run_with_retries`'s own sequential loop simply
+never starts.
+
+**Only bounds an adapter that actually reports cost.** `_known_total_
+cost` mirrors `TaskRun.total_cost_usd`'s own rule exactly (any unknown
+attempt cost poisons the whole sum, computed here over a plain list
+since no `TaskRun` exists yet mid-loop): the moment any attempt's cost is
+`None`, the running total is `None`, and a `None` total can never meet a
+numeric ceiling. An adapter that never reports cost (OpenHands, Codex
+without a `verdict.yml` pricing fallback configured) simply cannot be
+bounded by a dollar ceiling — honestly unenforceable, not silently
+ignored — `test_cost_ceiling_never_fires_for_an_adapter_with_unknown_
+cost` checks this directly.
+
+**A cost-ceiling abort is not an agent failure — ties to Phase 11,
+exactly as the brief asks.** The synthetic abort `Verdict` reuses
+`VerdictStatus.ERROR` for the identical reason Phase 15's suite-level
+ceiling-skip already does (`suite/runner.py::_skipped_task_run`): ERROR
+already means "not evaluated as a normal attempt, for a reason that
+isn't the agent's fault," and `ConfigResult.pass_rate`/`tasks_errored`
+(Phase 10/11) already exclude ERROR from both sides of the ratio — no new
+accounting rule was written for this phase; the existing one already
+says the right thing the moment the abort is tagged ERROR. This is a
+genuine reuse, not a coincidence: Phase 11's whole taxonomy exists
+precisely to separate "the agent's code was evaluated and found wanting"
+from "nothing about the agent's actual work was evaluated," and a cost-
+ceiling abort is squarely the second kind.
+
+**Partial results preserved, marked, never lost.** Every attempt that
+actually ran before the ceiling fired stays in `TaskRun.attempts`
+untouched — real signals, real cost, real `Verdict.status`, exactly as
+graded. The abort marker is a single ADDITIONAL entry appended at the
+end, never a replacement; `TaskRun.total_cost_usd` still sums correctly
+across the real attempts plus the marker's own `cost_usd=0.0` (the abort
+itself spent nothing new). Only when the ceiling is crossed on the
+*final* attempt `max_attempts` would have allowed anyway is no marker
+added at all — there's no attempt actually being skipped in that case,
+so the run just ends the way it always would have
+(`test_cost_ceiling_never_appends_a_marker_on_the_final_allowed_
+attempt`).
+
+## Two ceilings, two layers, composable
+
+Phase 15's `run_suite(..., cost_ceiling_usd=...)` bounds total spend
+across every `(config, task)` pair in a whole suite; this phase's
+`run_suite(..., run_cost_ceiling_usd=...)` is threaded straight through
+to each pair's own `run_with_retries` call, bounding one task's own
+retry spend. Deliberately separate parameter names and separate CLI
+flags (`--cost-ceiling-usd` vs. `--run-cost-ceiling-usd` on `bench`;
+`verdict run` — which only ever grades one task — exposes just
+`--cost-ceiling-usd`, unambiguous at that scope) because they answer
+different questions ("never spend more than $X on this whole suite" vs.
+"never spend more than $Y chasing one stubborn task") and are checked by
+two different mechanisms (`_CostCeiling`'s cross-process shared counter,
+gating whether a NEW pair starts at all; `run_with_retries`'s own
+sequential loop, gating whether a NEW attempt starts within one pair) —
+they compose freely, with no interaction between them, and either can be
+set without the other.
+
+## Tests
+
+- `tests/test_adapter_backoff.py` — `looks_transient`/`exec_result_is_
+  transient` against known transient and non-transient shapes;
+  `backoff_delay`'s exponential growth and jitter scaling;
+  `call_with_backoff`'s core contract (returns immediately on success,
+  retries only while `is_transient` says so, uses exponential delays,
+  gives up after `max_retries` and returns the last result) — all with
+  an injected `sleep`, no real waiting anywhere in this file. The brief's
+  own acceptance case, checked for all five adapters via `FakeSandbox`'s
+  `results=[...]` queue: two injected 429s followed by a success still
+  produces a normal `AttemptResult`
+  (`test_all_adapters_retry_a_transient_failure_and_then_succeed`); a
+  permanently rate-limited CLI still raises its adapter's own error after
+  exhausting the retry budget; a non-transient failure (bad task, not a
+  rate limit) is never retried at all.
+- `tests/test_cost_ceiling.py` — the brief's other acceptance case: a
+  ceiling reached mid-retry stops further attempts cleanly, preserves
+  every real attempt already made, marks the abort ERROR (excluded from
+  `errored`/`pass_rate`), and genuinely prevents the adapter from being
+  called again (not just marked after the fact); a ceiling never reached
+  changes nothing; the final-allowed-attempt edge case adds no spurious
+  marker; an unknown-cost adapter can never trigger the ceiling;
+  `--cost-ceiling-usd`/`--run-cost-ceiling-usd` default to disabled.
+  `test_run_suite_cost_ceiling_abort_is_excluded_from_the_leaderboard`
+  runs the full `run_suite` path end to end with two configs — the
+  expensive one aborts and is excluded from its own `ConfigResult.pass_
+  rate`, while an unrelated cheap config alongside it runs its full
+  `max_attempts`, completely unaffected.
+
+## What's explicitly out of scope for Phase 18
+
+- **A raw HTTP transport for any coding-agent Adapter.** All five stay
+  CLI-subprocess adapters, per Phase 5's own reasoning (a stable process
+  boundary, the developer's own already-authenticated binary) — backoff
+  operates on `ExecResult`, never a real HTTP status code, because
+  Verdict genuinely never sees one for these adapters (unlike Phase 16's
+  `AnthropicVisionTransport`, which does call an API directly and could
+  in principle inspect a real status code — a difference not unified in
+  this phase, since the two "retry a paid API" needs arose in different
+  phases against different kinds of call sites).
+- **Preemptive, mid-attempt cost enforcement.** Both the per-run and
+  per-suite ceilings are checked between attempts/pairs, never by killing
+  an already-running sandbox — see "Hard ceiling within the limits of
+  what Verdict can see" above.
+- **A configurable retry policy per adapter.** `DEFAULT_MAX_RETRIES`/
+  `DEFAULT_BASE_DELAY_SECONDS`/`DEFAULT_MAX_DELAY_SECONDS` are shared
+  module constants, not exposed as a new constructor argument or CLI flag
+  on each of the five adapters — every adapter's existing `timeout_
+  seconds` constructor parameter was already the one piece of retry-
+  adjacent configuration this codebase exposed per-adapter, and this
+  phase didn't extend that surface further.
+- **Distinguishing WHICH kind of transient failure occurred.** `looks_
+  transient` doesn't distinguish a 429 from a 503 from "overloaded" text
+  — all three get the identical backoff treatment. A provider that wants
+  materially different handling per status (e.g. honoring a `Retry-After`
+  header) would need a real HTTP transport to read one from, which these
+  CLI-wrapped adapters don't have access to in the first place.
+- **`gate_cmd` gaining a cost ceiling.** `verdict gate` grades an
+  existing diff in place — no adapter is ever driven, so there's no
+  agent spend for either ceiling to bound.
