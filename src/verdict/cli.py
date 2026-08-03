@@ -35,6 +35,7 @@ from verdict.flakiness import (
 from verdict.frontend.vision_judge import MockVisionJudge, RealVisionJudge, VisionJudge
 from verdict.frontend.vision_transport import AnthropicVisionTransport
 from verdict.integrity import TestChangeAllowance
+from verdict.monorepo import PackageSelectionError
 from verdict.pr_comment import build_comment_from_file
 from verdict.report import render_task_run
 from verdict.report_html import HistoryKey, render_html
@@ -360,6 +361,17 @@ def run_cmd(
         ..., "--agent", help=f"Which adapter to drive: mock | {' | '.join(_REAL_AGENTS)}"
     ),
     repo: Path = typer.Option(..., "--repo", help="Path to a git repository to grade against."),
+    package: str | None = typer.Option(
+        None,
+        "--package",
+        help=(
+            "Which package this task targets in a monorepo — a path relative to --repo, e.g. "
+            "'services/api'. Required whenever the repo's shape is ambiguous (root verdict.yml "
+            "declares more than one `packages:` entry, or the repo root has no project files but "
+            "multiple subdirectories each look like their own project) — Verdict never guesses. "
+            "Omit for a normal single-project repo."
+        ),
+    ),
     max_attempts: int = typer.Option(
         1,
         "--max-attempts",
@@ -452,6 +464,7 @@ def run_cmd(
         # 0 means "no ceiling" at the CLI layer, same spelling every other
         # None-disables-the-cap knob in this CLI already uses.
         cost_ceiling_usd=cost_ceiling_usd if cost_ceiling_usd > 0 else None,
+        package=package,
     )
 
     if "cli" in report:
@@ -627,6 +640,15 @@ def gate_cmd(
     base: str = typer.Option(
         ..., "--base", help="Git ref to diff/attribute against (a PR's base branch or merge-base SHA)."
     ),
+    package: str | None = typer.Option(
+        None,
+        "--package",
+        help=(
+            "Which package this PR/diff targets in a monorepo — a path relative to --repo, e.g. "
+            "'services/api'. Required whenever the repo's shape is ambiguous — see `verdict run "
+            "--help`'s --package for the full rule. Omit for a normal single-project repo."
+        ),
+    ),
     label: str = typer.Option("gate", "--label", help="Label for this run in json/html reports."),
     report: list[str] = typer.Option(["cli"], "--report", help=_REPORT_HELP),
     output_dir: Path = typer.Option(
@@ -713,8 +735,9 @@ def gate_cmd(
             base_ref=base,
             sandbox_config=sandbox_config,
             allow_test_changes=TestChangeAllowance(allowed=allow_test_changes),
+            package=package,
         )
-    except WorktreeError as exc:
+    except (WorktreeError, PackageSelectionError) as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
 
